@@ -27,6 +27,9 @@
  * to the artifacts dir after each visible step; a missing screenshot tool
  * only warns. With --strict-pixels a screenshot without the pet's colour
  * (or with it while hidden) fails the run; without it that is a warning.
+ * A bubble that is missing, not above the pets or more than 40 pt off the
+ * pets' centre always fails (it is found as what turned near-white since
+ * the shot before it). Each shot is retried a few times before it is judged.
  * Any protocol error, a timeout or a bad exit fails the run (exit code 1).
  */
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
@@ -336,19 +339,88 @@ function decodePng(buf) {
   return { width, height, channels, data: out };
 }
 
-/** Pixels close to each pet colour (tolerant of colour management). */
-function countPetPixels(png) {
+/** A pet-colour pixel: 1 = first pet (magenta), 2 = second (cyan), else 0. */
+function petColour(r, g, b) {
+  if (r > 190 && g < 80 && b > 190) return 1;
+  if (r < 80 && g > 190 && b > 190) return 2;
+  return 0;
+}
+
+const nearWhite = (data, i) => data[i] >= 225 && data[i + 1] >= 225 && data[i + 2] >= 225;
+
+/**
+ * Pet-colour pixel counts, and the box of the densest pet-coloured block —
+ * desktop icons (a Dock, a browser logo) can carry a few such pixels too.
+ */
+function petPixels(img) {
+  const { data, channels, width, height } = img;
   let first = 0;
   let second = 0;
-  const { data, channels } = png;
-  for (let i = 0; i + 2 < data.length; i += channels) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    if (r > 190 && g < 80 && b > 190) first += 1;
-    else if (r < 80 && g > 190 && b > 190) second += 1;
+  const mask = new Uint8Array(width * height);
+  const rows = new Array(height).fill(0);
+  for (let i = 0, p = 0; i + 2 < data.length; i += channels, p += 1) {
+    const kind = petColour(data[i], data[i + 1], data[i + 2]);
+    if (!kind) continue;
+    if (kind === 1) first += 1;
+    else second += 1;
+    mask[p] = 1;
+    rows[Math.floor(p / width)] += 1;
   }
-  return { first, second };
+  return { first, second, box: denseBox(mask, rows, width, { rowMin: 20, rowGap: 16, colMin: 5, colGap: 120 }) };
+}
+
+/** Box of the densest block of a pixel mask (rows first, then columns inside them). */
+function denseBox(mask, rows, width, { rowMin, rowGap, colMin, colGap }) {
+  const rowRun = densestRun(rows, rowMin, rowGap);
+  if (!rowRun) return null;
+  const cols = new Array(width).fill(0);
+  for (let y = rowRun.from; y <= rowRun.to; y += 1) {
+    for (let x = 0; x < width; x += 1) cols[x] += mask[y * width + x];
+  }
+  const colRun = densestRun(cols, colMin, colGap);
+  if (!colRun) return null;
+  return { minX: colRun.from, maxX: colRun.to, minY: rowRun.from, maxY: rowRun.to, px: colRun.total };
+}
+
+/** The densest run of indices whose count is >= min, allowing gaps <= maxGap. */
+function densestRun(counts, min, maxGap) {
+  let best = null;
+  let cur = null;
+  let gap = 0;
+  for (let i = 0; i < counts.length; i += 1) {
+    if (counts[i] >= min) {
+      if (!cur) cur = { from: i, to: i, total: 0 };
+      cur.to = i;
+      cur.total += counts[i];
+      gap = 0;
+    } else if (cur && ++gap > maxGap) {
+      if (!best || cur.total > best.total) best = cur;
+      cur = null;
+    }
+  }
+  if (cur && (!best || cur.total > best.total)) best = cur;
+  return best;
+}
+
+/**
+ * The bubble's box: near-white pixels in `img` that were not near-white in
+ * `before` (the same scene without the bubble). A light-theme bubble is a
+ * white panel; a dark one has near-white text — either way the box centre
+ * is the bubble's centre. Null when nothing bubble-sized appeared.
+ */
+function bubbleBox(img, before) {
+  const { data, channels, width, height } = img;
+  const same = before && before.width === width && before.height === height;
+  const fresh = new Uint8Array(width * height);
+  const rows = new Array(height).fill(0);
+  for (let p = 0, i = 0; p < width * height; p += 1, i += channels) {
+    if (!nearWhite(data, i)) continue;
+    if (same && nearWhite(before.data, p * before.channels)) continue;
+    fresh[p] = 1;
+    rows[Math.floor(p / width)] += 1;
+  }
+  const box = denseBox(fresh, rows, width, { rowMin: 2, rowGap: 6, colMin: 1, colGap: 12 });
+  return box && box.px >= 150 ? box : null;
 }
 
 function haveTool(cmd, args = ['-version']) {
@@ -378,7 +450,9 @@ function screenshot(file) {
         windowsHide: true
       });
     } else if (haveTool('import')) {
-      execFileSync('import', ['-window', 'root', file], { timeout: 20_000 });
+      // PNG24: 8-bit RGB. Left to itself ImageMagick writes a palette or
+      // 1-bit greyscale PNG for a scene with few colours.
+      execFileSync('import', ['-window', 'root', '-depth', '8', `PNG24:${file}`], { timeout: 20_000 });
     } else if (haveTool('ffmpeg')) {
       const geo = execFileSync('xwininfo', ['-root'], { encoding: 'utf8', timeout: 10_000 });
       const w = /Width:\s*(\d+)/.exec(geo)?.[1];
@@ -399,83 +473,155 @@ function screenshot(file) {
   return existsSync(file);
 }
 
-function pixelCounts(name, file) {
+function readShot(name, file) {
   try {
-    const png = decodePng(readFileSync(file));
-    if (png) return countPetPixels(png);
-    warn(`${name}: screenshot PNG format not decodable here; pixel check skipped`);
+    const buf = readFileSync(file);
+    const img = decodePng(buf);
+    if (img) return img;
+    const what = buf.length >= 29 ? `depth ${buf[24]}, colour type ${buf[25]}, interlace ${buf[28]}` : 'truncated';
+    warn(`${name}: screenshot PNG not decodable here (${what}); pixel checks skipped`);
   } catch (error) {
-    warn(`${name}: pixel check failed: ${error.message}`);
+    warn(`${name}: reading the screenshot failed: ${error.message}`);
   }
   return null;
 }
 
-/** Linux: one PNG per visible window of the pet (pet + bubble), via xdotool + ffmpeg. */
-function windowShots(rootFile) {
-  if (!petPid || !haveTool('xdotool', ['version']) || !haveTool('ffmpeg')) return [];
-  let ids = [];
+/**
+ * Rootless XWayland (a GNOME / KDE Wayland session): the X root window
+ * reads black, but each X window's contents can be read. Paint the pet's
+ * visible windows (pet + bubble) at their screen positions onto a black
+ * root-sized image and write it over `file`. False when that fails.
+ */
+function compositeWindows(file) {
+  if (!petPid || !haveTool('xdotool', ['version']) || !haveTool('ffmpeg')) return false;
   try {
-    ids = execFileSync('xdotool', ['search', '--onlyvisible', '--pid', String(petPid)], {
-      encoding: 'utf8',
-      timeout: 10_000
-    })
-      .split('\n')
-      .filter((id) => /^\d+$/.test(id));
-  } catch {
-    return [];
-  }
-  const files = [];
-  for (const id of ids) {
-    const file = rootFile.replace(/\.png$/, `-win${id}.png`);
+    const root = execFileSync('xwininfo', ['-root'], { encoding: 'utf8', timeout: 10_000 });
+    const width = Number(/Width:\s*(\d+)/.exec(root)[1]);
+    const height = Number(/Height:\s*(\d+)/.exec(root)[1]);
+    const canvas = Buffer.alloc(width * height * 4);
+    for (let i = 3; i < canvas.length; i += 4) canvas[i] = 255;
+    let ids = [];
     try {
+      ids = execFileSync('xdotool', ['search', '--onlyvisible', '--pid', String(petPid)], { encoding: 'utf8', timeout: 10_000 })
+        .split('\n')
+        .filter((id) => /^\d+$/.test(id));
+    } catch {
+      // no visible window (hidden pet): a black screen is the right answer
+    }
+    for (const id of ids) {
+      const geo = execFileSync('xwininfo', ['-id', id], { encoding: 'utf8', timeout: 10_000 });
+      const left = Number(/Absolute upper-left X:\s*(-?\d+)/.exec(geo)[1]);
+      const top = Number(/Absolute upper-left Y:\s*(-?\d+)/.exec(geo)[1]);
+      const part = `${file}.win${id}.png`;
       execFileSync(
         'ffmpeg',
-        ['-loglevel', 'error', '-y', '-f', 'x11grab', '-window_id', id, '-i', process.env.DISPLAY ?? ':0', '-frames:v', '1', file],
+        ['-loglevel', 'error', '-y', '-f', 'x11grab', '-window_id', id, '-i', process.env.DISPLAY ?? ':0', '-frames:v', '1', part],
         { timeout: 20_000 }
       );
-      if (existsSync(file)) files.push(file);
-    } catch (error) {
-      warn(`window ${id} capture failed: ${error.message.split('\n')[0]}`);
-    }
-  }
-  return files;
-}
-
-/** Screenshot + pixel expectations ('first' / 'second' visible, or none). */
-let petPid = null;
-const shots = [];
-async function capture(name, expect) {
-  await sleep(1200); // poll tick (100 ms) + a few frames + compositor
-  const file = join(opts.artifacts, `${String(shots.length + 1).padStart(2, '0')}-${name}.png`);
-  if (!screenshot(file)) return;
-  let counts = pixelCounts(name, file);
-  // Rootless XWayland (a GNOME / KDE Wayland session): the X root window is
-  // black, but each X window's own contents can still be read.
-  if (platform === 'linux' && process.env.WAYLAND_DISPLAY && counts && expect.first === true && counts.first === 0) {
-    const files = windowShots(file);
-    if (files.length > 0) {
-      counts = { first: 0, second: 0 };
-      for (const f of files) {
-        const c = pixelCounts(name, f);
-        if (c) {
-          counts.first += c.first;
-          counts.second += c.second;
+      const img = decodePng(readFileSync(part));
+      rmSync(part, { force: true });
+      if (!img) continue;
+      for (let y = 0; y < img.height; y += 1) {
+        for (let x = 0; x < img.width; x += 1) {
+          const sx = left + x;
+          const sy = top + y;
+          if (sx < 0 || sy < 0 || sx >= width || sy >= height) continue;
+          const i = (y * img.width + x) * img.channels;
+          const o = (sy * width + sx) * 4;
+          canvas[o] = img.data[i];
+          canvas[o + 1] = img.data[i + 1];
+          canvas[o + 2] = img.data[i + 2];
         }
       }
-      info(`${name}: root window is black (rootless XWayland); read ${files.length} pet window(s) instead`);
     }
+    writeFileSync(file, encodePng(width, height, canvas));
+    return true;
+  } catch (error) {
+    warn(`window composite failed: ${error.message.split('\n')[0]}`);
+    return false;
   }
-  shots.push({ name, file, counts });
-  if (!counts) return;
-  info(`${name}: screenshot ${file} — first-pet px ${counts.first}, second-pet px ${counts.second}`);
+}
+
+/** One screenshot, decoded; null when unavailable (already warned). */
+function takeShot(name, file) {
+  if (!screenshot(file)) return null;
+  if (platform === 'linux' && process.env.WAYLAND_DISPLAY && !compositeWindows(file)) return null;
+  return readShot(name, file);
+}
+
+const MIN_PET_PX = 2000;
+/** Width of the coloured part of the synthetic sprites at size m, in points. */
+const SPRITE_W = Math.round(CELL_W * 0.75);
+const SPRITE_INSET = Math.round(24 * 0.75);
+const groupSpan = (duo) =>
+  duo ? 2 * SPRITE_W + Math.round(SPRITE_W * 0.05) - 2 * SPRITE_INSET : SPRITE_W - 2 * SPRITE_INSET;
+/** Bubble centre may sit this far (points) from the pets' centre. */
+const BUBBLE_CENTRE_TOLERANCE = 40;
+
+/** Pixel problems of one shot: [] = as expected. */
+function shotProblems(img, expect, before) {
+  const pets = petPixels(img);
   const problems = [];
-  const min = 2000;
-  if (expect.first === true && counts.first < min) problems.push('first pet not visible');
-  if (expect.second === true && counts.second < min) problems.push('second pet not visible');
-  if (expect.first === false && counts.first >= min) problems.push('first pet visible while hidden');
-  if (expect.second === false && counts.second >= min) problems.push('second pet visible');
-  if (problems.length === 0) return pass(`${name}: pixels as expected`);
-  const text = `${name}: ${problems.join(', ')} (screenshot ${file})`;
+  if (expect.first === true && pets.first < MIN_PET_PX) problems.push('first pet not visible');
+  if (expect.second === true && pets.second < MIN_PET_PX) problems.push('second pet not visible');
+  if (expect.first === false && pets.first >= MIN_PET_PX) problems.push('first pet visible while hidden');
+  if (expect.second === false && pets.second >= MIN_PET_PX) problems.push('second pet visible');
+  const result = { pets, bubble: null, problems, bubbleProblems: [] };
+  if (!expect.bubble || problems.length > 0 || !pets.box) return result;
+  const bubble = bubbleBox(img, before);
+  result.bubble = bubble;
+  if (!bubble) {
+    result.bubbleProblems.push('no bubble found');
+    return result;
+  }
+  // Screenshot pixels per point (2 on a Retina display).
+  const scale = (pets.box.maxX - pets.box.minX + 1) / groupSpan(expect.second === true);
+  const petCx = (pets.box.minX + pets.box.maxX) / 2;
+  const bubbleCx = (bubble.minX + bubble.maxX) / 2;
+  const dx = bubbleCx - petCx;
+  result.bubbleDx = Math.round(dx / scale);
+  if (Math.abs(dx) > BUBBLE_CENTRE_TOLERANCE * scale) {
+    result.bubbleProblems.push(`bubble centre ${Math.round(dx / scale)} pt from the pets' centre (x ${Math.round(bubbleCx)} vs ${Math.round(petCx)} px)`);
+  }
+  if (bubble.maxY >= pets.box.minY) {
+    result.bubbleProblems.push(`bubble not above the pets (bubble bottom y ${bubble.maxY}, pets top y ${pets.box.minY} px)`);
+  }
+  return result;
+}
+
+/**
+ * Screenshot + expectations ('first' / 'second' visible or not; `bubble`:
+ * a bubble centred above the pets, found against the `before` shot).
+ * Retries a few times before judging: a window can take a moment to map,
+ * paint its first frame or move. Pet visibility fails only with
+ * --strict-pixels; a misplaced or missing bubble always fails. Without a
+ * usable screenshot both are skipped with a warning.
+ */
+let petPid = null;
+const shots = [];
+const images = new Map();
+async function capture(name, expect, { before = null } = {}) {
+  const file = join(opts.artifacts, `${String(shots.length + 1).padStart(2, '0')}-${name}.png`);
+  let img = null;
+  let result = null;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    await sleep(attempt === 1 ? 1200 : 1000); // poll tick (100 ms) + a few frames + compositor
+    img = takeShot(name, file);
+    if (!img) break;
+    result = shotProblems(img, expect, before ? images.get(before) : null);
+    if (result.problems.length === 0 && result.bubbleProblems.length === 0) break;
+    info(`${name}: attempt ${attempt}: ${[...result.problems, ...result.bubbleProblems].join(', ')}; retrying`);
+  }
+  const counts = result ? { first: result.pets.first, second: result.pets.second } : null;
+  shots.push({ name, file, counts, bubble: result?.bubble ?? null, bubbleDx: result?.bubbleDx ?? null });
+  if (!img || !result) return;
+  images.set(name, img);
+  info(`${name}: screenshot ${file} — first-pet px ${counts.first}, second-pet px ${counts.second}`);
+  if (result.bubble) info(`${name}: bubble box ${JSON.stringify(result.bubble)}, centre offset ${result.bubbleDx} pt`);
+  if (result.bubbleProblems.length > 0) fail(`${name}: ${result.bubbleProblems.join(', ')} (screenshot ${file})`);
+  if (expect.bubble && result.problems.length === 0) pass(`${name}: bubble centred above the pets (${result.bubbleDx} pt off centre)`);
+  if (result.problems.length === 0) return pass(`${name}: pixels as expected`);
+  const text = `${name}: ${result.problems.join(', ')} (screenshot ${file})`;
   if (opts.strictPixels) fail(text);
   warn(text);
 }
@@ -860,7 +1006,7 @@ async function smoke(cleanup) {
   pass('render duo accepted');
 
   conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, bubble: 'Smoke test · bubble from Electron' }) });
-  await capture('bubble', { first: true, second: true });
+  await capture('bubble', { first: true, second: true, bubble: true }, { before: 'render-duo' });
   conn.check('bubble');
   pass('render with bubble accepted');
 
@@ -917,7 +1063,7 @@ async function smoke(cleanup) {
     fail(`${NATIVE_STATE_FILE} is readable by group/other`);
   }
   pass(`timeline moment recorded in ${NATIVE_STATE_FILE}`);
-  await capture('timeline', { first: true, second: true });
+  await capture('timeline', { first: true, second: true, bubble: true }, { before: 'shown-again' });
   if (early) fail(`ti-pet exited after the handoff: ${JSON.stringify(early)}`);
   pass('pet keeps running after Electron left');
 
@@ -1033,4 +1179,3 @@ try {
   writeFileSync(join(opts.artifacts, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`);
 }
 process.exit(exitCode);
-

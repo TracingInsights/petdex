@@ -5,7 +5,9 @@ name: ti-pet smoke
 # desktop app's side of the native pet protocol: spawn → hello/ready → menu →
 # show → render solo/duo/bubble → hide → handoff + timeline → adopt → quit,
 # with desktop screenshots after each visible step (synthetic flat-colour
-# pets, never pet art). Path-filtered to ti-pet like ti-pet-ci.yml, so
+# pets, never pet art). --strict-pixels everywhere: a pet missing from (or
+# showing in) a screenshot fails the job, and so does a bubble that is not
+# centred above the pets. Path-filtered to ti-pet like ti-pet-ci.yml, so
 # upstream's workflows and their triggers stay untouched.
 #
 # Manual run: Actions → "ti-pet smoke" → Run workflow; `binary` = "source"
@@ -47,20 +49,15 @@ jobs:
           - target: linux-x64
             runner: ubuntu-24.04
             exe: ""
-            # Xvfb + openbox: a plain X server, so the screenshots are exact.
-            pixels: "--strict-pixels"
           - target: win32-x64
             runner: windows-2022
             exe: ".exe"
-            pixels: ""
           - target: darwin-arm64
             runner: macos-15
             exe: ""
-            pixels: ""
           - target: darwin-x64
             runner: macos-15-intel
             exe: ""
-            pixels: ""
     env:
       FROM_SOURCE: ${{ (inputs.binary || 'source') == 'source' }}
       RELEASE_TAG: ${{ inputs.binary }}
@@ -170,7 +167,7 @@ jobs:
             openbox >/dev/null 2>&1 &
             sleep 1
             node packages/ti-pet/tests/smoke/driver.mjs --binary "$TI_PET" \
-              --artifacts "$RUNNER_TEMP/smoke" --timeout-ms 20000 ${{ matrix.pixels }}
+              --artifacts "$RUNNER_TEMP/smoke" --timeout-ms 20000 --strict-pixels
           '
 
       - name: Smoke
@@ -180,7 +177,7 @@ jobs:
           set -euo pipefail
           node --version
           node packages/ti-pet/tests/smoke/driver.mjs --binary "$TI_PET" \
-            --artifacts "$RUNNER_TEMP/smoke" --timeout-ms 20000 ${{ matrix.pixels }}
+            --artifacts "$RUNNER_TEMP/smoke" --timeout-ms 20000 --strict-pixels
 
       - name: Job summary
         if: always()
@@ -195,7 +192,7 @@ jobs:
             if (s.error) lines.push(`**Error:** ${s.error}`);
             for (const step of s.steps) lines.push(`- ✅ ${step}`);
             for (const w of s.warnings) lines.push(`- ⚠️ ${w}`);
-            for (const shot of s.screenshots) lines.push(`- 📷 ${shot.name}: ${shot.counts ? `first ${shot.counts.first} px, second ${shot.counts.second} px` : "no pixel check"}`);
+            for (const shot of s.screenshots) lines.push(`- 📷 ${shot.name}: ${shot.counts ? `first ${shot.counts.first} px, second ${shot.counts.second} px` : "no pixel check"}${shot.bubbleDx != null ? `, bubble ${shot.bubbleDx} pt off centre` : ""}`);
             if (s.quarantine) lines.push(`- 🔒 quarantined copy launched: ${s.quarantine.launched}${s.quarantine.note ? ` (${s.quarantine.note})` : ""}`);
             fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
           ' "$RUNNER_TEMP/smoke/summary.json"

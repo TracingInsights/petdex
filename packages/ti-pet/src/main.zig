@@ -781,8 +781,13 @@ fn placeWindow(model: *Model, fx: *Effects) void {
         return;
     };
     // `position` is the first sprite's top-left (native-pet.mjs groupRect).
-    _ = fx.moveWindow("main", want.x - firstOffset(model) - cur.x, want.y - cur.y, true);
+    const moved = fx.moveWindow("main", want.x - firstOffset(model) - cur.x, want.y - cur.y, true);
     model.pending_move = null;
+    if (!is_linux) if (moved) |m| {
+        model.pet_x = m.x;
+        model.pet_y = m.y;
+        model.have_position = true;
+    };
 }
 
 fn quitPet() void {
@@ -898,6 +903,7 @@ fn poll(model: *Model, fx: *Effects) void {
         }
     }
     if (model.bubble_until_ms != 0 and now >= model.bubble_until_ms) setBubble(model, null, null, 0);
+    placeBubble(model, fx);
     if (model.driven) return;
     // Re-evaluate only when something changed: a local reaction ended or
     // the timeline moved to its next entry. Re-applying every tick cost
@@ -926,6 +932,8 @@ fn frameClock(model: *Model, fx: *Effects) void {
     model.pet_x = read.x;
     model.pet_y = read.y;
     model.have_position = true;
+    // The bubble follows the pet (also while it is dragged).
+    defer placeBubbleAt(model, fx, model.pet_x, model.pet_y);
     const now = fx.wallMs();
     if (model.dragging) {
         if (read.primary_down) {
@@ -1068,6 +1076,42 @@ const bubble_w: f32 = 260;
 const bubble_h: f32 = 64;
 const bubble_gap: f32 = 6;
 
+/// Win/mac: the bubble's top-left for a pet window at (pet_x, pet_y),
+/// centred over the sprite group (it spans the whole window) and above it.
+fn bubbleX(model: *const Model, pet_x: f64) f64 {
+    return pet_x + windowW(model) / 2 - bubble_w / 2;
+}
+
+fn bubbleY(pet_y: f64) f64 {
+    return pet_y - bubble_h - bubble_gap;
+}
+
+/// Win/mac: keep the bubble window centred above the pet. The SDK applies
+/// a secondary window's x/y only when it creates it (AppKit even centres
+/// it on screen), so the bubble is moved by the difference between where
+/// it is and where it belongs. Both rects come from moveWindow, which
+/// every host reports in one space (top-left origin, points / DIPs).
+/// (pet_x, pet_y) is the main window's fresh origin. Linux uses a
+/// GtkPopover anchored to the pet instead.
+fn placeBubbleAt(model: *const Model, fx: *Effects, pet_x: f64, pet_y: f64) void {
+    if (is_linux or !bubbleShown(model)) return;
+    // Null until the runtime created the declared window (after update).
+    const cur = fx.moveWindow("bubble", 0, 0, false) orelse return;
+    const dx = bubbleX(model, pet_x) - cur.x;
+    const dy = bubbleY(pet_y) - cur.y;
+    if (@abs(dx) < 0.5 and @abs(dy) < 0.5) return;
+    _ = fx.moveWindow("bubble", dx, dy, false);
+}
+
+fn placeBubble(model: *Model, fx: *Effects) void {
+    if (is_linux or !bubbleShown(model)) return;
+    const pet = fx.moveWindow("main", 0, 0, false) orelse return;
+    model.pet_x = pet.x;
+    model.pet_y = pet.y;
+    model.have_position = true;
+    placeBubbleAt(model, fx, pet.x, pet.y);
+}
+
 fn bubbleShown(model: *const Model) bool {
     return onScreen(model) and model.first.ok and model.bubble_len > 0;
 }
@@ -1096,8 +1140,8 @@ fn petWindows(model: *const Model, scratch: *PetApp.WindowsScratch) []const PetA
             .canvas_label = "bubble-canvas",
             .width = bubble_w,
             .height = bubble_h,
-            .x = @floatCast(model.pet_x + windowW(model) / 2 - bubble_w / 2),
-            .y = @floatCast(model.pet_y - bubble_h - bubble_gap),
+            .x = @floatCast(bubbleX(model, model.pet_x)),
+            .y = @floatCast(bubbleY(model.pet_y)),
             .resizable = false,
             .titlebar = .chromeless,
             .floating = true,
