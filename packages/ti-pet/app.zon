@@ -3,7 +3,7 @@
     .name = "ti-pet",
     .display_name = "TracingInsights Pet",
     .description = "TracingInsights desktop pet: Petdex's native renderer driven by the TracingInsights desktop app.",
-    .version = "0.1.0",
+    .version = "0.1.1",
     .icons = .{"assets/icon.png"},
     .platforms = .{ "macos", "windows", "linux" },
     .permissions = .{ "view", "command" },

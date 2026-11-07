@@ -1,0 +1,209 @@
+name: ti-pet smoke
+
+# Runs the real ti-pet binary on Linux, Windows and macOS (arm64 + Intel)
+# under packages/ti-pet/tests/smoke/driver.mjs, which plays the TracingInsights
+# desktop app's side of the native pet protocol: spawn → hello/ready → menu →
+# show → render solo/duo/bubble → hide → handoff + timeline → adopt → quit,
+# with desktop screenshots after each visible step (synthetic flat-colour
+# pets, never pet art). Path-filtered to ti-pet like ti-pet-ci.yml, so
+# upstream's workflows and their triggers stay untouched.
+#
+# Manual run: Actions → "ti-pet smoke" → Run workflow; `binary` = "source"
+# (build this commit, the default) or a ti-pet-v* release tag (smoke the
+# published assets, checked against that release's SHA256SUMS).
+
+on:
+  push:
+    paths:
+      - "packages/ti-pet/**"
+      - "packages/petdex-desktop-native/src/sprite.zig"
+      - "packages/petdex-desktop-native/src/catalog.zig"
+      - "patches/native-sdk-*.patch"
+      - "scripts/patch-native-sdk.sh"
+      - ".github/workflows/ti-pet-smoke.yml"
+  workflow_dispatch:
+    inputs:
+      binary:
+        description: '"source" to build this commit, or a ti-pet-v* release tag to smoke its assets'
+        required: true
+        default: "source"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ti-pet-smoke-${{ github.ref }}-${{ inputs.binary || 'source' }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: smoke ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-24.04
+            exe: ""
+            # Xvfb + openbox: a plain X server, so the screenshots are exact.
+            pixels: "--strict-pixels"
+          - target: win32-x64
+            runner: windows-2022
+            exe: ".exe"
+            pixels: ""
+          - target: darwin-arm64
+            runner: macos-15
+            exe: ""
+            pixels: ""
+          - target: darwin-x64
+            runner: macos-15-intel
+            exe: ""
+            pixels: ""
+    env:
+      FROM_SOURCE: ${{ (inputs.binary || 'source') == 'source' }}
+      RELEASE_TAG: ${{ inputs.binary }}
+
+    steps:
+      - name: Checkout petdex
+        uses: actions/checkout@v7
+
+      - name: Install Linux GUI libraries and a headless display
+        # Build set as in ti-pet-release.yml, plus Xvfb, a window manager
+        # and the screenshot tools the driver uses.
+        if: matrix.target == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libx11-dev pkg-config webp-pixbuf-loader \
+            xvfb openbox imagemagick xdotool x11-utils
+
+      # ---- build from source: the same steps as ti-pet-release.yml ----
+
+      - name: Clone the Native SDK
+        # Keep identical to ti-pet-release.yml (and upstream's pin).
+        if: env.FROM_SOURCE == 'true'
+        env:
+          NATIVE_SDK_REMOTE: "https://github.com/Railly/native.git"
+          NATIVE_SDK_BRANCH: "feat/floating-window-0.5.3"
+          NATIVE_SDK_REF: "c0b10d027efa490fc99a3bc7f1cf88b015999d45"
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$NATIVE_SDK_BRANCH" "$NATIVE_SDK_REMOTE" "$GITHUB_WORKSPACE/native-sdk"
+          git -C "$GITHUB_WORKSPACE/native-sdk" fetch --depth 1 origin "$NATIVE_SDK_REF"
+          git -C "$GITHUB_WORKSPACE/native-sdk" checkout --detach "$NATIVE_SDK_REF"
+          echo "NATIVE_SDK_PATH=$GITHUB_WORKSPACE/native-sdk" >> "$GITHUB_ENV"
+
+      - name: Apply the Native SDK patches
+        if: env.FROM_SOURCE == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/patch-native-sdk.sh
+          shopt -s nullglob
+          for PATCH in packages/ti-pet/patches/*.patch; do
+            if git -C "$NATIVE_SDK_PATH" apply --unidiff-zero --reverse --check "$GITHUB_WORKSPACE/$PATCH" >/dev/null 2>&1; then
+              echo "already applied $PATCH"; continue
+            fi
+            git -C "$NATIVE_SDK_PATH" apply --unidiff-zero "$GITHUB_WORKSPACE/$PATCH"
+            echo "applied $PATCH"
+          done
+
+      - name: Install Zig 0.16.0
+        if: env.FROM_SOURCE == 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build the native CLI from the pinned SDK
+        if: env.FROM_SOURCE == 'true'
+        working-directory: ${{ env.NATIVE_SDK_PATH }}
+        shell: bash
+        run: |
+          zig build cli
+          echo "NATIVE_CLI=$NATIVE_SDK_PATH/zig-out/bin/native" >> "$GITHUB_ENV"
+
+      - name: Build ti-pet
+        if: env.FROM_SOURCE == 'true'
+        working-directory: packages/ti-pet
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$NATIVE_CLI" build -Dcpu=baseline -Dtrace=off
+          ls -lh zig-out/bin/
+          BIN="$PWD/zig-out/bin/ti-pet${{ matrix.exe }}"
+          # Git Bash on Windows: hand node a C:\ path, not /d/a/...
+          if command -v cygpath >/dev/null; then BIN=$(cygpath -w "$BIN"); fi
+          echo "TI_PET=$BIN" >> "$GITHUB_ENV"
+
+      # ---- or the published release asset ----
+
+      - name: Download the release asset
+        if: env.FROM_SOURCE != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ti-pet-${{ matrix.target }}${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^ti-pet-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "binary must be \"source\" or a ti-pet-vX.Y.Z tag: $RELEASE_TAG"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release"
+          gh release download "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" -p "$ASSET" -p SHA256SUMS
+          grep " $ASSET\$" SHA256SUMS > want.sha256
+          if command -v sha256sum >/dev/null; then sha256sum -c want.sha256; else shasum -a 256 -c want.sha256; fi
+          chmod +x "$ASSET"
+          BIN="$PWD/$ASSET"
+          if command -v cygpath >/dev/null; then BIN=$(cygpath -w "$BIN"); fi
+          echo "TI_PET=$BIN" >> "$GITHUB_ENV"
+
+      # ---- smoke ----
+
+      - name: Smoke (Linux, Xvfb + openbox)
+        if: matrix.target == 'linux-x64'
+        run: |
+          set -euo pipefail
+          node --version
+          xvfb-run -a -s "-screen 0 1280x800x24" bash -c '
+            openbox >/dev/null 2>&1 &
+            sleep 1
+            node packages/ti-pet/tests/smoke/driver.mjs --binary "$TI_PET" \
+              --artifacts "$RUNNER_TEMP/smoke" --timeout-ms 20000 ${{ matrix.pixels }}
+          '
+
+      - name: Smoke
+        if: matrix.target != 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          node packages/ti-pet/tests/smoke/driver.mjs --binary "$TI_PET" \
+            --artifacts "$RUNNER_TEMP/smoke" --timeout-ms 20000 ${{ matrix.pixels }}
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = process.argv[1];
+            if (!fs.existsSync(p)) { console.log("no summary.json"); process.exit(0); }
+            const s = JSON.parse(fs.readFileSync(p, "utf8"));
+            const lines = [`### ti-pet smoke ${s.platform}-${s.arch}: ${s.ok ? "PASS" : "FAIL"}`];
+            if (s.error) lines.push(`**Error:** ${s.error}`);
+            for (const step of s.steps) lines.push(`- ✅ ${step}`);
+            for (const w of s.warnings) lines.push(`- ⚠️ ${w}`);
+            for (const shot of s.screenshots) lines.push(`- 📷 ${shot.name}: ${shot.counts ? `first ${shot.counts.first} px, second ${shot.counts.second} px` : "no pixel check"}`);
+            if (s.quarantine) lines.push(`- 🔒 quarantined copy launched: ${s.quarantine.launched}${s.quarantine.note ? ` (${s.quarantine.note})` : ""}`);
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          ' "$RUNNER_TEMP/smoke/summary.json"
+
+      - name: Upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ti-pet-smoke-${{ matrix.target }}
+          path: ${{ runner.temp }}/smoke
+          if-no-files-found: warn

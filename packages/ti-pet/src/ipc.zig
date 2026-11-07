@@ -15,7 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 
-pub const version = "0.1.0";
+pub const version = "0.1.1";
 pub const caps = [_][]const u8{ "duo", "bubble", "menu", "timeline" };
 
 const SpinMutex = struct {

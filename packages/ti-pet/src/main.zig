@@ -1257,7 +1257,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.socket) |socket| {
         const token = args.token_file orelse return error.MissingTokenFile;
-        const pid: u32 = if (builtin.os.tag == .linux) @intCast(std.os.linux.getpid()) else if (builtin.os.tag == .windows) 0 else @intCast(std.c.getpid());
+        const pid: u32 = if (builtin.os.tag == .linux) @intCast(std.os.linux.getpid()) else if (builtin.os.tag == .windows) std.os.windows.GetCurrentProcessId() else @intCast(std.c.getpid());
         server = ipc.start(gpa, socket, token, pid) catch |err| switch (err) {
             // One pet per profile: the running one keeps the socket.
             error.AlreadyRunning => return,
