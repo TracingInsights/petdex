@@ -1,0 +1,337 @@
+diff --git a/src/platform/linux/gtk_host.c b/src/platform/linux/gtk_host.c
+index d0c83f3..d17bad0 100644
+--- a/src/platform/linux/gtk_host.c
++++ b/src/platform/linux/gtk_host.c
+@@ -404,6 +404,10 @@ struct native_sdk_gtk_host {
+     int did_startup;
+     int app_active;
+     guint frame_timer;
++    /* ti-pet patch: the frame tick's current interval and how many fast
++     * ticks remain (see native_sdk_frame_tick_boost). */
++    guint frame_tick_ms;
++    int frame_fast_ticks;
+ 
+     char **allowed_origins;
+     int allowed_origins_count;
+@@ -2845,8 +2849,31 @@ static gboolean on_shortcut_key_pressed(GtkEventControllerKey *controller, guint
+     return FALSE;
+ }
+ 
++/* ti-pet patch: the tick pumps FRAME and polls window allocations; at
++ * 16 ms it was ~60 wakeups a second for an app whose frames are driven
++ * by its gpu surface. It runs fast for a while after startup and after
++ * any window is created, resized or reports a new allocation (GTK
++ * settles an allocation over a few frames), and at 100 ms otherwise. */
++#define NATIVE_SDK_FRAME_TICK_FAST_MS 16
++#define NATIVE_SDK_FRAME_TICK_IDLE_MS 100
++#define NATIVE_SDK_FRAME_TICK_BOOST 60
++static gboolean native_sdk_frame_tick(gpointer data);
++
++static void native_sdk_frame_tick_arm(native_sdk_gtk_host_t *host, guint interval_ms) {
++    if (host->frame_timer) g_source_remove(host->frame_timer);
++    host->frame_tick_ms = interval_ms;
++    host->frame_timer = g_timeout_add(interval_ms, native_sdk_frame_tick, host);
++}
++
++static void native_sdk_frame_tick_boost(native_sdk_gtk_host_t *host, int ticks) {
++    if (!host || host->did_shutdown || !host->did_startup) return;
++    if (host->frame_fast_ticks < ticks) host->frame_fast_ticks = ticks;
++    if (host->frame_tick_ms != NATIVE_SDK_FRAME_TICK_FAST_MS) native_sdk_frame_tick_arm(host, NATIVE_SDK_FRAME_TICK_FAST_MS);
++}
++
+ static gboolean native_sdk_frame_tick(gpointer data) {
+     native_sdk_gtk_host_t *host = data;
++    int changed = 0;
+     /* GTK only reports the window's real allocation after mapping (and never
+      * re-fires notify::default-width for it), so poll for allocation/scale
+      * changes here and re-emit resize + window frame events; shell layout
+@@ -2866,9 +2893,17 @@ static gboolean native_sdk_frame_tick(gpointer data) {
+             win->emitted_scale = scale;
+             native_sdk_emit_resize(host, win);
+             native_sdk_emit_window_frame(host, win, 1);
++            changed = 1;
+         }
+     }
+     native_sdk_emit(host, (native_sdk_gtk_event_t){ .kind = NATIVE_SDK_GTK_EVENT_FRAME });
++    if (changed && host->frame_fast_ticks < NATIVE_SDK_FRAME_TICK_BOOST) host->frame_fast_ticks = NATIVE_SDK_FRAME_TICK_BOOST;
++    if (host->frame_fast_ticks > 0 && --host->frame_fast_ticks == 0 && !host->did_shutdown) {
++        /* Re-arming replaces this source; returning REMOVE drops the old one. */
++        host->frame_tick_ms = NATIVE_SDK_FRAME_TICK_IDLE_MS;
++        host->frame_timer = g_timeout_add(NATIVE_SDK_FRAME_TICK_IDLE_MS, native_sdk_frame_tick, host);
++        return G_SOURCE_REMOVE;
++    }
+     return G_SOURCE_CONTINUE;
+ }
+ 
+@@ -2878,6 +2913,7 @@ static void on_resize(GtkWidget *widget, GParamSpec *pspec, gpointer data) {
+     native_sdk_gtk_window_t *win = data;
+     native_sdk_emit_window_frame(win->host, win, 1);
+     native_sdk_emit_resize(win->host, win);
++    native_sdk_frame_tick_boost(win->host, NATIVE_SDK_FRAME_TICK_BOOST);
+ }
+ 
+ static void on_focus(GtkWindow *window, GParamSpec *pspec, gpointer data) {
+@@ -3580,7 +3616,8 @@ static void on_activate(GtkApplication *app, gpointer data) {
+     native_sdk_emit_resize(host, win);
+     native_sdk_emit_window_frame(host, win, 1);
+ 
+-    host->frame_timer = g_timeout_add(16, native_sdk_frame_tick, host);
++    host->frame_fast_ticks = 2 * NATIVE_SDK_FRAME_TICK_BOOST;
++    native_sdk_frame_tick_arm(host, NATIVE_SDK_FRAME_TICK_FAST_MS);
+ }
+ 
+ /* Deep links. GApplication turns the non-flag commandline of a launch
+@@ -4301,6 +4338,7 @@ int native_sdk_gtk_create_window(native_sdk_gtk_host_t *host, uint64_t window_id
+     free(title);
+     free(label);
+     if (!win) return 0;
++    native_sdk_frame_tick_boost(host, NATIVE_SDK_FRAME_TICK_BOOST);
+ 
+     if (win->popup) {
+         native_sdk_emit_resize(host, win);
+@@ -4464,6 +4502,7 @@ int native_sdk_gtk_move_window(native_sdk_gtk_host_t *host, uint64_t window_id,
+ }
+ 
+ int native_sdk_gtk_resize_window(native_sdk_gtk_host_t *host, uint64_t window_id, double width, double height, int bottom_center) {
++    native_sdk_frame_tick_boost(host, NATIVE_SDK_FRAME_TICK_BOOST);
+ #if NATIVE_SDK_HAS_X11
+     native_sdk_gtk_window_t *win = native_sdk_find_window(host, window_id);
+     Display *xdisplay = NULL;
+@@ -4834,9 +4873,12 @@ int native_sdk_gtk_request_gpu_surface_frame(native_sdk_gtk_host_t *host, uint64
+     free(label_copy);
+     if (!view || view->kind != NATIVE_SDK_GTK_VIEW_GPU_SURFACE || !view->widget) return 0;
+     /* A runtime frame request is a producer on the surface's single
+-     * frame-event scheduler: redraw retained content and arm the next
+-     * grid-paced emission (folding into one already in flight). */
+-    gtk_widget_queue_draw(view->widget);
++     * frame-event scheduler: arm the next grid-paced emission (folding
++     * into one already in flight). ti-pet patch: no queue_draw here —
++     * the retained buffer only changes in a present, which queues its
++     * own draw (GTK repaints exposed content by itself), so this one
++     * repainted unchanged pixels: two full cairo paints per sprite
++     * frame instead of one. */
+     native_sdk_gpu_surface_schedule_frame_emission(view);
+     return 1;
+ }
+diff --git a/src/primitives/canvas/reference.zig b/src/primitives/canvas/reference.zig
+index bbf819b..bd12ecb 100644
+--- a/src/primitives/canvas/reference.zig
++++ b/src/primitives/canvas/reference.zig
+@@ -97,6 +97,12 @@ pub const ReferenceImage = struct {
+     /// per planned frame; 0 — every registered canvas image — keeps the
+     /// classic hash-the-bytes keying byte-identically.
+     content_fingerprint: u64 = 0,
++    /// ti-pet patch: the finished `renderImageFingerprintForResource`
++    /// value, stamped once by the runtime image registry at
++    /// registration (0 = compute it). Same key byte for byte, but the
++    /// planner no longer re-hashes every registered image's pixels on
++    /// every planned frame (16 sprite frames ~ 2.5 MB per frame).
++    resource_fingerprint: u64 = 0,
+     /// PRESENTATION-ONLY resource: composited by live GPU/packet hosts,
+     /// invisible to the deterministic reference renderer (see the
+     /// policy comment in `findReferenceImage`). Media-surface textures
+@@ -252,16 +258,16 @@ pub const ReferenceRenderSurface = struct {
+     pub fn clearRect(self: ReferenceRenderSurface, rect: geometry.RectF, color: Color) void {
+         const pixel_rect = referencePixelRect(rect, self.width, self.height) orelse return;
+         const pixel = colorToRgba8(color);
+-        var y = pixel_rect.y;
++        // ti-pet patch: fill the first row pixel by pixel, then copy it
++        // to the others (same bytes, a fraction of the per-byte stores).
++        const row_len = pixel_rect.width * 4;
++        const first = (pixel_rect.y * self.width + pixel_rect.x) * 4;
++        var x: usize = 0;
++        while (x < pixel_rect.width) : (x += 1) @memcpy(self.pixels[first + x * 4 ..][0..4], &pixel);
++        var y = pixel_rect.y + 1;
+         while (y < pixel_rect.y + pixel_rect.height) : (y += 1) {
+-            var x = pixel_rect.x;
+-            while (x < pixel_rect.x + pixel_rect.width) : (x += 1) {
+-                const index = (y * self.width + x) * 4;
+-                self.pixels[index + 0] = pixel[0];
+-                self.pixels[index + 1] = pixel[1];
+-                self.pixels[index + 2] = pixel[2];
+-                self.pixels[index + 3] = pixel[3];
+-            }
++            const index = (y * self.width + pixel_rect.x) * 4;
++            @memcpy(self.pixels[index..][0..row_len], self.pixels[first..][0..row_len]);
+         }
+     }
+ 
+@@ -531,7 +537,7 @@ pub const ReferenceRenderSurface = struct {
+                         self.pixels[index + 2],
+                         self.pixels[index + 3],
+                     };
+-                    const out = blendRgba8(dst, rgba8ToColor(sample), command.opacity * image_opacity);
++                    const out = blendImageSample(dst, sample, command.opacity * image_opacity);
+                     self.pixels[index + 0] = out[0];
+                     self.pixels[index + 1] = out[1];
+                     self.pixels[index + 2] = out[2];
+@@ -540,6 +546,8 @@ pub const ReferenceRenderSurface = struct {
+             }
+             return;
+         }
++        if (value.sampling == .nearest and !has_mask and
++            self.drawImageNearestSeparable(image, src_rect, dst_rect, pixel_rect, command.opacity * image_opacity)) return;
+         var y = pixel_rect.y;
+         while (y < pixel_rect.y + pixel_rect.height) : (y += 1) {
+             var x = pixel_rect.x;
+@@ -557,13 +565,60 @@ pub const ReferenceRenderSurface = struct {
+                     self.pixels[index + 2],
+                     self.pixels[index + 3],
+                 };
+-                const out = blendRgba8(dst, rgba8ToColor(sample), command.opacity * image_opacity);
++                const out = blendImageSample(dst, sample, command.opacity * image_opacity);
++                self.pixels[index + 0] = out[0];
++                self.pixels[index + 1] = out[1];
++                self.pixels[index + 2] = out[2];
++                self.pixels[index + 3] = out[3];
++            }
++        }
++    }
++
++    /// ti-pet patch: the unmasked nearest draw above, separated. `u`
++    /// depends only on a pixel's column and `v` only on its row (as does
++    /// `containsPoint`), so each destination column's and row's source
++    /// index is computed once per draw with the very expressions the
++    /// per-pixel loop evaluates — the same bytes without the per-pixel
++    /// float work. False (caller takes the general loop) for spans over
++    /// the stack tables.
++    fn drawImageNearestSeparable(self: ReferenceRenderSurface, image: ReferenceImage, src_rect: geometry.RectF, dst_rect: geometry.RectF, pixel_rect: ReferencePixelRect, opacity: f32) bool {
++        const max_span = 4096;
++        if (pixel_rect.width > max_span or pixel_rect.height > max_span) return false;
++        if (dst_rect.isEmpty()) return true; // containsPoint is false everywhere
++        // Source column / row per destination column / row; -1 = outside dst_rect.
++        var columns: [max_span]i32 = undefined;
++        var rows: [max_span]i32 = undefined;
++        for (0..pixel_rect.width) |i| {
++            const px = @as(f32, @floatFromInt(pixel_rect.x + i)) + 0.5;
++            columns[i] = if (px >= dst_rect.minX() and px < dst_rect.maxX()) blk: {
++                const u = std.math.clamp((px - dst_rect.x) / dst_rect.width, 0, 1);
++                break :blk clampI32(referenceFloor(src_rect.x + std.math.clamp(u, 0, 1) * src_rect.width), 0, @intCast(image.width - 1));
++            } else -1;
++        }
++        for (0..pixel_rect.height) |i| {
++            const py = @as(f32, @floatFromInt(pixel_rect.y + i)) + 0.5;
++            rows[i] = if (py >= dst_rect.minY() and py < dst_rect.maxY()) blk: {
++                const v = std.math.clamp((py - dst_rect.y) / dst_rect.height, 0, 1);
++                break :blk clampI32(referenceFloor(src_rect.y + std.math.clamp(v, 0, 1) * src_rect.height), 0, @intCast(image.height - 1));
++            } else -1;
++        }
++        for (rows[0..pixel_rect.height], pixel_rect.y..) |sy, y| {
++            if (sy < 0) continue;
++            const src_row = @as(usize, @intCast(sy)) * image.width;
++            for (columns[0..pixel_rect.width], pixel_rect.x..) |sx, x| {
++                if (sx < 0) continue;
++                const s = (src_row + @as(usize, @intCast(sx))) * 4;
++                const sample = [4]u8{ image.pixels[s + 0], image.pixels[s + 1], image.pixels[s + 2], image.pixels[s + 3] };
++                const index = (y * self.width + x) * 4;
++                const dst = [4]u8{ self.pixels[index + 0], self.pixels[index + 1], self.pixels[index + 2], self.pixels[index + 3] };
++                const out = blendImageSample(dst, sample, opacity);
+                 self.pixels[index + 0] = out[0];
+                 self.pixels[index + 1] = out[1];
+                 self.pixels[index + 2] = out[2];
+                 self.pixels[index + 3] = out[3];
+             }
+         }
++        return true;
+     }
+ 
+     /// A borrowed sampled panel for this draw, or null when the draw
+@@ -1652,6 +1707,19 @@ fn rgba8ToColor(pixel: [4]u8) Color {
+     );
+ }
+ 
++/// ti-pet patch: `blendRgba8(dst, rgba8ToColor(sample), opacity)`, with
++/// the two cases a sprite is mostly made of answered without the float
++/// round-trip (full opacity only, where both are exact): an opaque sample
++/// replaces dst byte for byte, a fully transparent one keeps dst (or
++/// clears it when dst alpha is 0, like the general path).
++inline fn blendImageSample(dst: [4]u8, sample: [4]u8, opacity: f32) [4]u8 {
++    if (opacity == 1) {
++        if (sample[3] == 255) return sample;
++        if (sample[3] == 0) return if (dst[3] == 0) .{ 0, 0, 0, 0 } else dst;
++    }
++    return blendRgba8(dst, rgba8ToColor(sample), opacity);
++}
++
+ fn blendRgba8(dst: [4]u8, src: Color, opacity: f32) [4]u8 {
+     const src_a = std.math.clamp(src.a * std.math.clamp(opacity, 0, 1), 0, 1);
+     const dst_a = @as(f32, @floatFromInt(dst[3])) / 255.0;
+diff --git a/src/primitives/canvas/render_fingerprints.zig b/src/primitives/canvas/render_fingerprints.zig
+index 422fcbd..417b882 100644
+--- a/src/primitives/canvas/render_fingerprints.zig
++++ b/src/primitives/canvas/render_fingerprints.zig
+@@ -50,6 +50,7 @@ pub fn renderImageFingerprint(image_id: ImageId) u64 {
+ 
+ pub fn renderImageFingerprintForResource(image_id: ImageId, image: ?ReferenceImage) u64 {
+     const value = image orelse return renderImageFingerprint(image_id);
++    if (value.resource_fingerprint != 0 and value.id == image_id) return value.resource_fingerprint;
+     var hash = renderImageFingerprint(image_id);
+     hash = resourceHashUsize(hash, value.width);
+     hash = resourceHashUsize(hash, value.height);
+diff --git a/src/primitives/canvas/root.zig b/src/primitives/canvas/root.zig
+index d8f9c2d..df9b2e1 100644
+--- a/src/primitives/canvas/root.zig
++++ b/src/primitives/canvas/root.zig
+@@ -237,6 +237,7 @@ pub const RenderImageCacheActionKind = render_model.RenderImageCacheActionKind;
+ pub const RenderImageCacheAction = render_model.RenderImageCacheAction;
+ pub const RenderImageCachePlan = render_model.RenderImageCachePlan;
+ pub const RenderImageCachePlanner = render_model.RenderImageCachePlanner;
++pub const renderImageFingerprintForResource = render_model.renderImageFingerprintForResource;
+ pub const RenderResourceKind = render_model.RenderResourceKind;
+ pub const RenderResource = render_model.RenderResource;
+ pub const RenderResourcePlan = render_model.RenderResourcePlan;
+diff --git a/src/runtime/canvas_images.zig b/src/runtime/canvas_images.zig
+index e09d1fc..adeb967 100644
+--- a/src/runtime/canvas_images.zig
++++ b/src/runtime/canvas_images.zig
+@@ -40,6 +40,9 @@ pub const CanvasImageEntry = struct {
+     width: usize = 0,
+     height: usize = 0,
+     byte_len: usize = 0,
++    /// ti-pet patch: `renderImageFingerprintForResource` of the pixels,
++    /// computed once here instead of on every planned frame.
++    fingerprint: u64 = 0,
+ };
+ 
+ /// Dimensions of a successfully registered image (the decode-and-register
+@@ -103,6 +106,12 @@ pub fn RuntimeCanvasImages(comptime Runtime: type) type {
+                 .width = width,
+                 .height = height,
+                 .byte_len = byte_len,
++                .fingerprint = canvas.renderImageFingerprintForResource(id, .{
++                    .id = id,
++                    .width = width,
++                    .height = height,
++                    .pixels = self.canvas_image_pixels[index][0..byte_len],
++                }),
+             };
+             // No pixel push here: GPU packet hosts receive the bytes
+             // through the binary upload side-channel when a packet's
+@@ -181,6 +190,7 @@ pub fn RuntimeCanvasImages(comptime Runtime: type) type {
+                     .width = entry.width,
+                     .height = entry.height,
+                     .pixels = self.canvas_image_pixels[index][0..entry.byte_len],
++                    .resource_fingerprint = entry.fingerprint,
+                 };
+             }
+             const media = runtime_media_surface.RuntimeMediaSurfaces(Runtime).adoptedMediaSurfaceTextures(
+diff --git a/src/runtime/canvas_widget_display.zig b/src/runtime/canvas_widget_display.zig
+index a941491..a4bd61f 100644
+--- a/src/runtime/canvas_widget_display.zig
++++ b/src/runtime/canvas_widget_display.zig
+@@ -325,7 +325,14 @@ pub fn RuntimeCanvasWidgetDisplay(comptime Runtime: type) type {
+             defer launch_timing.lapOnce("first_display_list_emitted");
+ 
+             var commands: [max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
+-            var chrome_storage = CanvasDisplayListScratch{};
++            // ti-pet patch: `CanvasDisplayListScratch{}` compiled to a
++            // memset of the whole scratch (~300 KB) on every refresh;
++            // only the counts need a value.
++            var chrome_storage: CanvasDisplayListScratch = undefined;
++            chrome_storage.gradient_stop_count = 0;
++            chrome_storage.path_element_count = 0;
++            chrome_storage.glyph_count = 0;
++            chrome_storage.text_len = 0;
+             var builder = canvas.Builder.init(&commands);
+             const current = self.views[view_index].canvasDisplayList();
+             const prefix_count = self.views[view_index].canvas_widget_display_list_prefix_count;

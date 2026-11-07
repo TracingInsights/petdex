@@ -1,0 +1,453 @@
+{
+  "v": 1,
+  "generatedAt": "2026-11-07T12:00:00.000Z",
+  "until": "2026-11-14T12:00:00.000Z",
+  "refreshAt": "2026-11-08T09:00:00.000Z",
+  "pets": {
+    "first": {
+      "id": "petdex:max-4",
+      "path": "/tmp/ti-pet-fixture/ud/pets/petdex:max-4/spritesheet.webp",
+      "rows": 9,
+      "scale": 1
+    },
+    "second": {
+      "id": "petdex:lando",
+      "path": "/tmp/ti-pet-fixture/ud/pets/petdex:lando/spritesheet.webp",
+      "rows": 9,
+      "scale": 1
+    }
+  },
+  "size": "m",
+  "quietUntil": "2026-11-07T19:30:00.000Z",
+  "sessionReactions": "calm",
+  "entries": [
+    {
+      "at": "2026-11-07T12:00:00.000Z",
+      "visible": true,
+      "state": "idle",
+      "row": 0,
+      "frames": 6,
+      "durationMs": 1100,
+      "once": false,
+      "still": false,
+      "playKey": "idle",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-07T19:30:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "On this day · 2026-11-07",
+      "bubbleTarget": "/stats/on-this-day/2026-11-07",
+      "duo": true,
+      "moment": {
+        "name": "lastFactDay",
+        "value": "2026-11-07"
+      }
+    },
+    {
+      "at": "2026-11-07T19:30:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-08T09:00:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "On this day · 2026-11-08",
+      "bubbleTarget": "/stats/on-this-day/2026-11-08",
+      "duo": true,
+      "moment": {
+        "name": "lastFactDay",
+        "value": "2026-11-08"
+      }
+    },
+    {
+      "at": "2026-11-08T09:00:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-08T16:30:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": true,
+      "still": false,
+      "playKey": "calendar:2026_20_race:lead",
+      "bubble": "Race in 30 min · São Paulo GP",
+      "bubbleTarget": "/",
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-08T16:30:01.010Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "Race in 30 min · São Paulo GP",
+      "bubbleTarget": "/",
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-08T16:30:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-08T17:00:00.000Z",
+      "visible": true,
+      "state": "jumping",
+      "row": 4,
+      "frames": 5,
+      "durationMs": 840,
+      "once": true,
+      "still": false,
+      "playKey": "calendar:2026_20_race:live",
+      "bubble": "Lights out! · São Paulo GP",
+      "bubbleTarget": "/",
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-08T17:00:00.840Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "Lights out! · São Paulo GP",
+      "bubbleTarget": "/",
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-08T17:00:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-08T20:00:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "Rate the São Paulo GP",
+      "bubbleTarget": "/rate/2026/sao-paulo/race",
+      "duo": true,
+      "moment": {
+        "name": "lastRateKey",
+        "value": "2026_20_race"
+      }
+    },
+    {
+      "at": "2026-11-08T20:00:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-09T09:00:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "On this day · 2026-11-09",
+      "bubbleTarget": "/stats/on-this-day/2026-11-09",
+      "duo": true,
+      "moment": {
+        "name": "lastFactDay",
+        "value": "2026-11-09"
+      }
+    },
+    {
+      "at": "2026-11-09T09:00:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-10T09:00:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "On this day · 2026-11-10",
+      "bubbleTarget": "/stats/on-this-day/2026-11-10",
+      "duo": true,
+      "moment": {
+        "name": "lastFactDay",
+        "value": "2026-11-10"
+      }
+    },
+    {
+      "at": "2026-11-10T09:00:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-11T09:00:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "On this day · 2026-11-11",
+      "bubbleTarget": "/stats/on-this-day/2026-11-11",
+      "duo": true,
+      "moment": {
+        "name": "lastFactDay",
+        "value": "2026-11-11"
+      }
+    },
+    {
+      "at": "2026-11-11T09:00:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-12T09:00:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "On this day · 2026-11-12",
+      "bubbleTarget": "/stats/on-this-day/2026-11-12",
+      "duo": true,
+      "moment": {
+        "name": "lastFactDay",
+        "value": "2026-11-12"
+      }
+    },
+    {
+      "at": "2026-11-12T09:00:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-13T09:00:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "On this day · 2026-11-13",
+      "bubbleTarget": "/stats/on-this-day/2026-11-13",
+      "duo": true,
+      "moment": {
+        "name": "lastFactDay",
+        "value": "2026-11-13"
+      }
+    },
+    {
+      "at": "2026-11-13T09:00:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    },
+    {
+      "at": "2026-11-14T09:00:00.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": "On this day · 2026-11-14",
+      "bubbleTarget": "/stats/on-this-day/2026-11-14",
+      "duo": true,
+      "moment": {
+        "name": "lastFactDay",
+        "value": "2026-11-14"
+      }
+    },
+    {
+      "at": "2026-11-14T09:00:15.000Z",
+      "visible": true,
+      "state": "waiting",
+      "row": 6,
+      "frames": 6,
+      "durationMs": 1010,
+      "once": false,
+      "still": false,
+      "playKey": "waiting",
+      "bubble": null,
+      "bubbleTarget": null,
+      "duo": true,
+      "moment": null
+    }
+  ],
+  "sessions": [
+    {
+      "key": "2026_20_qualifying",
+      "kind": "qualifying",
+      "label": "Qualifying",
+      "gp": "São Paulo GP",
+      "start": "2026-11-07T18:00:00.000Z",
+      "end": "2026-11-07T19:00:00.000Z"
+    },
+    {
+      "key": "2026_20_race",
+      "kind": "race",
+      "label": "Race",
+      "gp": "São Paulo GP",
+      "start": "2026-11-08T17:00:00.000Z",
+      "end": "2026-11-08T19:00:00.000Z"
+    }
+  ],
+  "duo": {
+    "text": "2026 · Verstappen 3–1 Norris (races)",
+    "target": "/stats/compare/drivers?ids=max-verstappen,lando-norris&from=2026&to=2026"
+  },
+  "calendarTarget": "/",
+  "countdown": {
+    "format": "v1"
+  }
+}

@@ -1,0 +1,333 @@
+diff --git a/src/platform/linux/gtk_host.c b/src/platform/linux/gtk_host.c
+index 45eac2a..d0c83f3 100644
+--- a/src/platform/linux/gtk_host.c
++++ b/src/platform/linux/gtk_host.c
+@@ -253,6 +253,7 @@ typedef struct native_sdk_gtk_native_view {
+     native_sdk_gtk_drag_region_t *drag_regions;
+     size_t drag_region_count;
+     int gpu_drag_claimed_press;
++    int gpu_drag_claimed_n_press; /* ti-pet: click vs double-click on a drag region */
+     int gpu_native_drag_pending;
+     int gpu_native_drag_active;
+     double gpu_native_drag_press_x;
+@@ -873,6 +874,22 @@ static void native_sdk_emit_window_drag_command(native_sdk_gtk_native_view_t *vi
+     });
+ }
+ 
++/* ti-pet patch: a press inside a window-drag region never reaches the
++ * canvas (the compositor may own it), so report its click / double-click
++ * and the pointer entering the surface through the command channel too.
++ * Apps that do not know these names ignore them. */
++static void native_sdk_emit_view_command(native_sdk_gtk_native_view_t *view, const char *command) {
++    if (!view || !view->window || !view->window->host || !view->label) return;
++    native_sdk_emit(view->window->host, (native_sdk_gtk_event_t){
++        .kind = NATIVE_SDK_GTK_EVENT_NATIVE_COMMAND,
++        .window_id = view->window->id,
++        .view_label = view->label,
++        .view_label_len = strlen(view->label),
++        .command_name = command,
++        .command_name_len = strlen(command),
++    });
++}
++
+ static void native_sdk_emit_gpu_surface_text_input(native_sdk_gtk_native_view_t *view, int input_kind, const char *text, int has_composition_cursor, size_t composition_cursor) {
+     if (!view || !view->window || !view->window->host || !view->label) return;
+     native_sdk_emit(view->window->host, (native_sdk_gtk_event_t){
+@@ -1291,8 +1308,13 @@ static void native_sdk_gpu_pointer_pressed(GtkGestureClick *gesture, int n_press
+      * of beginning a move, exactly like the real titlebar. */
+     if (button == 0 && view->window && native_sdk_gpu_point_in_drag_region(view, x, y)) {
+         view->gpu_drag_claimed_press = 1;
++        view->gpu_drag_claimed_n_press = n_press;
+         if (n_press >= 2) {
+-            native_sdk_window_apply_titlebar_double_click(view->window);
++            native_sdk_emit_view_command(view, "native-sdk.window-drag.dblclick");
++            /* ti-pet patch: a fixed-size window has nothing to maximize;
++             * the titlebar convention only applies to resizable ones. */
++            if (view->window->gtk_window && gtk_window_get_resizable(view->window->gtk_window))
++                native_sdk_window_apply_titlebar_double_click(view->window);
+         } else {
+             /* Wait for the first real drag delta before handing the
+              * pointer to Wayland. Once gdk_toplevel_begin_move runs the
+@@ -1318,11 +1340,15 @@ static void native_sdk_gpu_pointer_released(GtkGestureClick *gesture, int n_pres
+     /* The matching release of a drag-claimed press: the widget pipeline
+      * never saw the down, so it must not see an orphaned up either. */
+     if (view->gpu_drag_claimed_press) {
++        const int was_pending = view->gpu_native_drag_pending;
+         view->gpu_drag_claimed_press = 0;
+         view->gpu_native_drag_pending = 0;
+         if (view->gpu_native_drag_active) {
+             view->gpu_native_drag_active = 0;
+             native_sdk_emit_window_drag_command(view, 0, 0);
++        } else if (was_pending && view->gpu_drag_claimed_n_press == 1) {
++            /* ti-pet patch: released before any drag delta = a click. */
++            native_sdk_emit_view_command(view, "native-sdk.window-drag.click");
+         }
+         return;
+     }
+@@ -1332,6 +1358,19 @@ static void native_sdk_gpu_pointer_released(GtkGestureClick *gesture, int n_pres
+     native_sdk_emit_gpu_surface_input(view, NATIVE_SDK_GTK_GPU_INPUT_POINTER_UP, x, y, button < 0 ? 0 : button, 0, 0, "", "", modifiers);
+ }
+ 
++/* ti-pet patch: pointer entered / left the surface (hover). */
++static void native_sdk_gpu_pointer_enter(GtkEventControllerMotion *controller, double x, double y, gpointer data) {
++    (void)controller;
++    (void)x;
++    (void)y;
++    native_sdk_emit_view_command(data, "native-sdk.pointer.enter");
++}
++
++static void native_sdk_gpu_pointer_leave(GtkEventControllerMotion *controller, gpointer data) {
++    (void)controller;
++    native_sdk_emit_view_command(data, "native-sdk.pointer.leave");
++}
++
+ static void native_sdk_gpu_pointer_motion(GtkEventControllerMotion *controller, double x, double y, gpointer data) {
+     native_sdk_gtk_native_view_t *view = data;
+     if (!view) return;
+@@ -1454,6 +1493,8 @@ static void native_sdk_setup_gpu_surface_view(native_sdk_gtk_native_view_t *view
+ 
+     GtkEventController *motion = gtk_event_controller_motion_new();
+     g_signal_connect(motion, "motion", G_CALLBACK(native_sdk_gpu_pointer_motion), view);
++    g_signal_connect(motion, "enter", G_CALLBACK(native_sdk_gpu_pointer_enter), view);
++    g_signal_connect(motion, "leave", G_CALLBACK(native_sdk_gpu_pointer_leave), view);
+     gtk_widget_add_controller(view->widget, motion);
+ 
+     GtkEventController *scroll = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+@@ -3113,6 +3154,56 @@ static void native_sdk_window_apply_x11_above(GtkWidget *widget, gpointer data)
+      * has not yet added ABOVE to. */
+     XChangeProperty(xdisplay, xid, net_wm_state, XA_ATOM, 32, PropModeAppend,
+                     (const unsigned char *)&above, 1);
++    /* ti-pet patch: a floating overlay (desktop pet, its bubble) is not a
++     * task: keep it out of the taskbar and the workspace pager. */
++    Atom skip[2] = {
++        gdk_x11_get_xatom_by_name_for_display(display, "_NET_WM_STATE_SKIP_TASKBAR"),
++        gdk_x11_get_xatom_by_name_for_display(display, "_NET_WM_STATE_SKIP_PAGER"),
++    };
++    if (skip[0] != None && skip[1] != None)
++        XChangeProperty(xdisplay, xid, net_wm_state, XA_ATOM, 32, PropModeAppend,
++                        (const unsigned char *)skip, 2);
++}
++#endif /* NATIVE_SDK_HAS_X11 */
++
++#if NATIVE_SDK_HAS_X11
++/* ti-pet patch: GTK4 rewrites _NET_WM_STATE when it maps the window, so
++ * the pre-map ABOVE / SKIP_* hints above can be lost (GNOME's Mutter on
++ * XWayland, measured 2026-11-06). Once mapped, ask the window manager the
++ * way the EWMH spec says for a mapped window: a _NET_WM_STATE ClientMessage
++ * to the root window, one per state (data.l[1] only carries two). */
++static void native_sdk_x11_send_wm_state(Display *xdisplay, Window xid, Atom net_wm_state, Atom state) {
++    XEvent event;
++    memset(&event, 0, sizeof(event));
++    event.xclient.type = ClientMessage;
++    event.xclient.window = xid;
++    event.xclient.message_type = net_wm_state;
++    event.xclient.format = 32;
++    event.xclient.data.l[0] = 1; /* _NET_WM_STATE_ADD */
++    event.xclient.data.l[1] = (long)state;
++    event.xclient.data.l[2] = 0;
++    event.xclient.data.l[3] = 1; /* normal application */
++    XSendEvent(xdisplay, DefaultRootWindow(xdisplay), False,
++               SubstructureRedirectMask | SubstructureNotifyMask, &event);
++}
++
++static void native_sdk_window_request_x11_above(GtkWidget *widget, gpointer data) {
++    (void)data;
++    GdkSurface *surface = gtk_native_get_surface(GTK_NATIVE(widget));
++    if (!surface || !GDK_IS_X11_SURFACE(surface)) return;
++    GdkDisplay *display = gdk_surface_get_display(surface);
++    if (!display || !GDK_IS_X11_DISPLAY(display)) return;
++    Display *xdisplay = GDK_DISPLAY_XDISPLAY(display);
++    Window xid = GDK_SURFACE_XID(surface);
++    if (!xdisplay || xid == None) return;
++    Atom net_wm_state = gdk_x11_get_xatom_by_name_for_display(display, "_NET_WM_STATE");
++    if (net_wm_state == None) return;
++    const char *names[] = { "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER" };
++    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++        Atom atom = gdk_x11_get_xatom_by_name_for_display(display, names[i]);
++        if (atom != None) native_sdk_x11_send_wm_state(xdisplay, xid, net_wm_state, atom);
++    }
++    XFlush(xdisplay);
+ }
+ #endif /* NATIVE_SDK_HAS_X11 */
+ 
+@@ -3223,6 +3314,7 @@ static void native_sdk_window_apply_flags(native_sdk_gtk_window_t *win, int wind
+     if (window_flags & NATIVE_SDK_WINDOW_FLAG_FLOATING) {
+ #if NATIVE_SDK_HAS_X11
+         g_signal_connect(widget, "realize", G_CALLBACK(native_sdk_window_apply_x11_above), NULL);
++        g_signal_connect_after(widget, "map", G_CALLBACK(native_sdk_window_request_x11_above), NULL);
+ #endif
+     }
+     if (window_flags & NATIVE_SDK_WINDOW_FLAG_TRANSPARENT) {
+@@ -3631,7 +3723,10 @@ static char **native_sdk_read_proc_argv(int *out_argc) {
+         gsize end = start;
+         while (end < length && contents[end] != '\0') end++;
+         /* The final entry may be unterminated; take it either way. */
+-        if (end > start) g_ptr_array_add(argv, g_strndup(contents + start, end - start));
++        /* ti-pet patch: GApplication rejects unknown --options, and the app
++         * parses its own argv; hand it argv[0] and URI arguments only. */
++        if (end > start && (argv->len == 0 || g_strstr_len(contents + start, (gssize)(end - start), "://")))
++            g_ptr_array_add(argv, g_strndup(contents + start, end - start));
+         start = end + 1;
+     }
+     g_free(contents);
+@@ -4294,6 +4389,112 @@ int native_sdk_gtk_start_window_drag(native_sdk_gtk_host_t *host, uint64_t windo
+     return 1;
+ }
+ 
++/* ti-pet patch: window move / resize for X11 (incl. XWayland), the GTK
++ * half of the AppKit/Win32 moveWindow + resizeWindow verbs. Wayland gives
++ * a client no positioning, so there both report failure and apps fall
++ * back to compositor drags. Coordinates are logical (device px / scale). */
++#if NATIVE_SDK_HAS_X11
++static int native_sdk_x11_window(native_sdk_gtk_window_t *win, Display **out_display, Window *out_xid, int *out_scale) {
++    if (!win || !win->gtk_window) return 0;
++    GdkSurface *surface = gtk_native_get_surface(GTK_NATIVE(win->gtk_window));
++    if (!surface || !GDK_IS_X11_SURFACE(surface)) return 0;
++    GdkDisplay *display = gdk_surface_get_display(surface);
++    if (!display || !GDK_IS_X11_DISPLAY(display)) return 0;
++    *out_display = GDK_DISPLAY_XDISPLAY(display);
++    *out_xid = GDK_SURFACE_XID(surface);
++    *out_scale = gdk_surface_get_scale_factor(surface);
++    if (*out_scale < 1) *out_scale = 1;
++    return *out_display != NULL && *out_xid != None;
++}
++
++static void native_sdk_x11_origin(Display *xdisplay, Window xid, int *x, int *y) {
++    Window child = None;
++    *x = 0;
++    *y = 0;
++    XTranslateCoordinates(xdisplay, xid, DefaultRootWindow(xdisplay), 0, 0, x, y, &child);
++}
++#endif
++
++int native_sdk_gtk_move_window(native_sdk_gtk_host_t *host, uint64_t window_id, double dx, double dy, int clamp,
++                               double *out_x, double *out_y, int *out_hit_x, int *out_hit_y, int *out_primary,
++                               double *out_cursor_x, double *out_cursor_y) {
++#if NATIVE_SDK_HAS_X11
++    native_sdk_gtk_window_t *win = native_sdk_find_window(host, window_id);
++    Display *xdisplay = NULL;
++    Window xid = None;
++    int scale = 1;
++    if (!native_sdk_x11_window(win, &xdisplay, &xid, &scale)) return 0;
++    int x = 0, y = 0;
++    native_sdk_x11_origin(xdisplay, xid, &x, &y);
++    *out_hit_x = 0;
++    *out_hit_y = 0;
++    if (dx != 0 || dy != 0) {
++        int nx = x + (int)(dx * scale + (dx < 0 ? -0.5 : 0.5));
++        int ny = y + (int)(dy * scale + (dy < 0 ? -0.5 : 0.5));
++        if (clamp) {
++            int w = gtk_widget_get_width(GTK_WIDGET(win->gtk_window)) * scale;
++            int h = gtk_widget_get_height(GTK_WIDGET(win->gtk_window)) * scale;
++            int sw = DisplayWidth(xdisplay, DefaultScreen(xdisplay));
++            int sh = DisplayHeight(xdisplay, DefaultScreen(xdisplay));
++            if (nx < 0) { nx = 0; *out_hit_x = 1; }
++            if (ny < 0) { ny = 0; *out_hit_y = 1; }
++            if (nx + w > sw) { nx = sw - w; *out_hit_x = 1; }
++            if (ny + h > sh) { ny = sh - h; *out_hit_y = 1; }
++        }
++        XMoveWindow(xdisplay, xid, nx, ny);
++        XFlush(xdisplay);
++        x = nx;
++        y = ny;
++    }
++    Window root_ret = None, child_ret = None;
++    int root_x = 0, root_y = 0, win_x = 0, win_y = 0;
++    unsigned int mask = 0;
++    XQueryPointer(xdisplay, DefaultRootWindow(xdisplay), &root_ret, &child_ret, &root_x, &root_y, &win_x, &win_y, &mask);
++    *out_x = (double)x / scale;
++    *out_y = (double)y / scale;
++    *out_primary = (mask & Button1Mask) != 0;
++    *out_cursor_x = (double)root_x / scale;
++    *out_cursor_y = (double)root_y / scale;
++    return 1;
++#else
++    (void)host; (void)window_id; (void)dx; (void)dy; (void)clamp; (void)out_x; (void)out_y;
++    (void)out_hit_x; (void)out_hit_y; (void)out_primary; (void)out_cursor_x; (void)out_cursor_y;
++    return 0;
++#endif
++}
++
++int native_sdk_gtk_resize_window(native_sdk_gtk_host_t *host, uint64_t window_id, double width, double height, int bottom_center) {
++#if NATIVE_SDK_HAS_X11
++    native_sdk_gtk_window_t *win = native_sdk_find_window(host, window_id);
++    Display *xdisplay = NULL;
++    Window xid = None;
++    int scale = 1;
++    if (!native_sdk_x11_window(win, &xdisplay, &xid, &scale)) return 0;
++    int old_w = gtk_widget_get_width(GTK_WIDGET(win->gtk_window));
++    int old_h = gtk_widget_get_height(GTK_WIDGET(win->gtk_window));
++    int x = 0, y = 0;
++    native_sdk_x11_origin(xdisplay, xid, &x, &y);
++    int w = (int)(width + 0.5);
++    int h = (int)(height + 0.5);
++    if (w < 1 || h < 1) return 0;
++    /* A non-resizable GtkWindow ignores a new default size: lift the flag
++     * for the change, then restore it. */
++    gboolean resizable = gtk_window_get_resizable(win->gtk_window);
++    if (!resizable) gtk_window_set_resizable(win->gtk_window, TRUE);
++    gtk_window_set_default_size(win->gtk_window, w, h);
++    XResizeWindow(xdisplay, xid, (unsigned)(w * scale), (unsigned)(h * scale));
++    if (!resizable) gtk_window_set_resizable(win->gtk_window, FALSE);
++    if (bottom_center && old_w > 0 && old_h > 0) {
++        XMoveWindow(xdisplay, xid, x + ((old_w - w) * scale) / 2, y + (old_h - h) * scale);
++    }
++    XFlush(xdisplay);
++    return 1;
++#else
++    (void)host; (void)window_id; (void)width; (void)height; (void)bottom_center;
++    return 0;
++#endif
++}
++
+ int native_sdk_gtk_set_window_drag_regions(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, const double *rects, const int *exclusions, size_t count) {
+     if (!host || !label || label_len == 0) return 0;
+     native_sdk_gtk_window_t *win = native_sdk_find_window(host, window_id);
+diff --git a/src/platform/linux/root.zig b/src/platform/linux/root.zig
+index d0acea6..4d2a8ed 100644
+--- a/src/platform/linux/root.zig
++++ b/src/platform/linux/root.zig
+@@ -142,6 +142,9 @@ extern fn native_sdk_gtk_set_shortcuts(host: *GtkHost, ids: [*]const [*]const u8
+ extern fn native_sdk_gtk_create_window(host: *GtkHost, window_id: u64, window_title: [*]const u8, window_title_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, window_flags: c_int, min_width: f64, min_height: f64, popup_parent_id: u64) c_int;
+ extern fn native_sdk_gtk_update_popup_window(host: *GtkHost, window_id: u64, width: f64, height: f64, anchor_x: f64, anchor_y: f64) c_int;
+ extern fn native_sdk_gtk_start_window_drag(host: *GtkHost, window_id: u64) c_int;
++// ti-pet patch: X11 move / resize.
++extern fn native_sdk_gtk_move_window(host: *GtkHost, window_id: u64, dx: f64, dy: f64, clamp: c_int, out_x: *f64, out_y: *f64, out_hit_x: *c_int, out_hit_y: *c_int, out_primary: *c_int, out_cursor_x: *f64, out_cursor_y: *f64) c_int;
++extern fn native_sdk_gtk_resize_window(host: *GtkHost, window_id: u64, width: f64, height: f64, bottom_center: c_int) c_int;
+ extern fn native_sdk_gtk_set_window_drag_regions(host: *GtkHost, window_id: u64, label: [*]const u8, label_len: usize, rects: [*]const f64, exclusions: [*]const c_int, count: usize) c_int;
+ extern fn native_sdk_gtk_show_context_menu(host: *GtkHost, window_id: u64, label: [*]const u8, label_len: usize, x: f64, y: f64, token: u64, items: [*]const GtkContextMenuItem, count: usize) c_int;
+ extern fn native_sdk_gtk_window_chrome(host: *GtkHost, window_id: u64, top: *f64, left: *f64, bottom: *f64, right: *f64, buttons_x: *f64, buttons_y: *f64, buttons_width: *f64, buttons_height: *f64) c_int;
+@@ -294,6 +297,8 @@ pub const LinuxPlatform = struct {
+                 .update_popup_window_fn = updatePopupWindow,
+                 .minimize_window_fn = minimizeWindow,
+                 .start_window_drag_fn = startWindowDrag,
++                .move_window_fn = moveWindow,
++                .resize_window_fn = resizeWindow,
+                 .set_window_drag_regions_fn = setWindowDragRegions,
+                 .window_chrome_fn = windowChrome,
+                 .create_view_fn = createView,
+@@ -790,6 +795,24 @@ fn minimizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerr
+     if (native_sdk_gtk_minimize_window(self.host, window_id) == 0) return error.WindowNotFound;
+ }
+ 
++fn moveWindow(context: ?*anyopaque, window_id: platform_mod.WindowId, dx: f64, dy: f64, clamp: bool) anyerror!platform_mod.MoveWindowResult {
++    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
++    var x: f64 = 0;
++    var y: f64 = 0;
++    var hit_x: c_int = 0;
++    var hit_y: c_int = 0;
++    var primary: c_int = 0;
++    var cursor_x: f64 = 0;
++    var cursor_y: f64 = 0;
++    if (native_sdk_gtk_move_window(self.host, window_id, dx, dy, if (clamp) 1 else 0, &x, &y, &hit_x, &hit_y, &primary, &cursor_x, &cursor_y) == 0) return error.WindowNotFound;
++    return .{ .x = x, .y = y, .hit_x = hit_x != 0, .hit_y = hit_y != 0, .primary_down = primary != 0, .cursor_x = cursor_x, .cursor_y = cursor_y };
++}
++
++fn resizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId, width: f64, height: f64, anchor: platform_mod.WindowResizeAnchor) anyerror!void {
++    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
++    if (native_sdk_gtk_resize_window(self.host, window_id, width, height, if (anchor == .bottom_center) 1 else 0) == 0) return error.WindowNotFound;
++}
++
+ fn startWindowDrag(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
+     const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+     if (native_sdk_gtk_start_window_drag(self.host, window_id) == 0) return error.WindowNotFound;
