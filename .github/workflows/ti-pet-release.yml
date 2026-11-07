@@ -34,7 +34,7 @@ jobs:
       matrix:
         include:
           - target: linux-x64
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
             exe: ""
           - target: win32-x64
             runner: windows-2022
@@ -72,7 +72,8 @@ jobs:
       - name: Install Linux GUI libraries
         # Same set as upstream: gtk4 is the host toolkit, libX11 carries
         # _NET_WM_STATE_ABOVE, webp-pixbuf-loader reads Petdex's webp sheets.
-        # ubuntu-22.04 (glibc 2.35) so the binary runs on older distros too.
+        # ubuntu-24.04 like upstream: the Native SDK needs GTK >= 4.10
+        # (GtkFileDialog); 22.04 ships 4.6. Older distros get the Electron pet.
         if: matrix.target == 'linux-x64'
         run: |
           sudo apt-get update

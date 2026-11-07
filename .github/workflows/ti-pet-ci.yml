@@ -85,7 +85,7 @@ jobs:
     # Linux build of the real app against the pinned, patched SDK — the same
     # steps as ti-pet-release.yml, without staging or publishing.
     name: build linux-x64
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout petdex
         uses: actions/checkout@v7
