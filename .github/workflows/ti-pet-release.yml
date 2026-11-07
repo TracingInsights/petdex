@@ -44,7 +44,7 @@ jobs:
           # when the app itself is signed. Unlike upstream's standalone
           # .app there is nothing for Gatekeeper to judge on its own.
           - target: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             exe: ""
           - target: darwin-x64
             runner: macos-15-intel
