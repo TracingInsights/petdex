@@ -770,7 +770,7 @@ test "weekend fixture: header, sprites, entries" {
     try testing.expectEqual(at("2026-11-08T09:00:00Z"), tl.refresh_at_ms);
     try testing.expectEqual(protocol.Size.m, tl.size);
     try testing.expectEqual(SessionReactions.calm, tl.session_reactions);
-    try testing.expectEqualStrings(fixture_user_data ++ "/pets/petdex:max-4/spritesheet.webp", tl.pets.first.?.path);
+    try testing.expectEqualStrings(fixture_user_data ++ "/pets/petdex-max-4/spritesheet.webp", tl.pets.first.?.path);
     try testing.expectEqual(@as(u8, 9), tl.pets.second.?.rows);
     try testing.expect(tl.entries.len > 20);
     try testing.expectEqual(@as(usize, 2), tl.sessions.len);
@@ -901,8 +901,8 @@ test "rejects: version, times, order, paths, poses, size" {
         .{ .find = "\"until\": \"2026-11-14T12:00:00.000Z\"", .replace = "\"until\": \"next week\"", .err = error.InvalidTimeline },
         .{ .find = "\"until\": \"2026-11-14T12:00:00.000Z\"", .replace = "\"until\": \"2026-11-07T11:00:00.000Z\"", .err = error.InvalidTimeline },
         .{ .find = "\"at\": \"2026-11-07T12:10:00.000Z\"", .replace = "\"at\": \"2026-11-07T11:10:00.000Z\"", .err = error.InvalidTimeline },
-        .{ .find = "\"/tmp/ti-pet-fixture/ud/pets/petdex:lando", .replace = "\"/tmp/elsewhere/pets/petdex:lando", .err = error.PathOutsideUserData },
-        .{ .find = "\"/tmp/ti-pet-fixture/ud/pets/petdex:max-4", .replace = "\"/tmp/ti-pet-fixture/ud/../pets/petdex:max-4", .err = error.PathOutsideUserData },
+        .{ .find = "\"/tmp/ti-pet-fixture/ud/pets/petdex-lando", .replace = "\"/tmp/elsewhere/pets/petdex-lando", .err = error.PathOutsideUserData },
+        .{ .find = "\"/tmp/ti-pet-fixture/ud/pets/petdex-max-4", .replace = "\"/tmp/ti-pet-fixture/ud/../pets/petdex-max-4", .err = error.PathOutsideUserData },
         .{ .find = "\"state\": \"waiting\"", .replace = "\"state\": \"dancing\"", .err = error.InvalidTimeline },
         .{ .find = "\"frames\": 6", .replace = "\"frames\": 9", .err = error.InvalidTimeline },
         .{ .find = "\"bubbleTarget\": \"/\"", .replace = "\"bubbleTarget\": \"//evil.example\"", .err = error.InvalidTimeline },
@@ -938,9 +938,11 @@ test "load: file inside --user-data only" {
     defer arena.deinit();
     const a = arena.allocator();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
-    // Re-root the fixture's sprite paths at this temp dir.
+    // Re-root the fixture's sprite paths at this temp dir, JSON-escaped:
+    // a Windows temp path carries backslashes.
     const good = try readFixture(a, "timeline-weekend.json");
-    const moved = try std.mem.replaceOwned(u8, a, good, fixture_user_data, dir);
+    const dir_json = try std.mem.replaceOwned(u8, a, dir, "\\", "\\\\");
+    const moved = try std.mem.replaceOwned(u8, a, good, fixture_user_data, dir_json);
     try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = moved });
     const path = try std.fs.path.join(a, &.{ dir, file_name });
 
