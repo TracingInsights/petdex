@@ -1,0 +1,5 @@
+# Unified diffs keep blank context lines as a single space, and sprite.zig is a
+# byte-identical upstream copy (scripts/check-ti-pet-upstream.sh): exempt both
+# from `git diff --check` (app-ci's whitespace gate) instead of altering them.
+*.patch -whitespace
+src/sprite.zig -whitespace
