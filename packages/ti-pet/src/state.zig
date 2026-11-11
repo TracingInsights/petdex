@@ -13,7 +13,15 @@
 //!     "launchAtLogin"?: bool,
 //!     "position"?: { "x", "y" },        last drop point
 //!     "shownMoments"?: [{ "name", "value" }]   the last 32, oldest first
+//!     "mutes"?: ["fact", …]             bubble kinds switched off with a
+//!                                       bubble's `mute` button (round 3)
 //!   }
+//!
+//! `mutes` holds BUBBLE_KINDS names; Electron turns each into its setting
+//! (fact → dailyFacts, rate → rateNudges, result → resultReactions,
+//! greeting → greetings, calendar → sessionReactions 'off') and an older
+//! Electron simply ignores the key. `shownMoments` may now carry
+//! `lastGreetingKey`.
 //!
 //! Always go through `update`: it re-reads the file before applying one
 //! change, so a field Electron already merged (and deleted with the file)
@@ -30,6 +38,9 @@ pub const file_name = "pet-native-state.json";
 /// native-state.mjs MAX_BYTES / MAX_MOMENTS.
 pub const max_file_bytes: usize = 64 * 1024;
 pub const max_moments: usize = 32;
+/// Distinct bubble kinds `mutes` keeps (there are six).
+pub const max_mutes: usize = 8;
+pub const max_mute_bytes: usize = timeline.max_bubble_kind_bytes;
 pub const max_moment_value_bytes: usize = timeline.max_moment_value_bytes;
 /// native-state.mjs ignores positions at or beyond this.
 const max_coord: f64 = 1e6;
@@ -56,6 +67,15 @@ pub const Moment = struct {
     }
 };
 
+pub const Mute = struct {
+    len: u8,
+    buf: [max_mute_bytes]u8,
+
+    pub fn kind(self: *const Mute) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 pub const NativeState = struct {
     enabled: ?bool = null,
     size: ?protocol.Size = null,
@@ -64,6 +84,25 @@ pub const NativeState = struct {
     position: ?Position = null,
     moments: [max_moments]Moment = undefined,
     moments_len: usize = 0,
+    mutes: [max_mutes]Mute = undefined,
+    mutes_len: usize = 0,
+
+    pub fn muted(self: *const NativeState) []const Mute {
+        return self.mutes[0..self.mutes_len];
+    }
+
+    /// Record a bubble kind the user muted. A repeat is skipped; false
+    /// when the name is not a bubble kind or the list is full.
+    pub fn addMute(self: *NativeState, kind: []const u8) bool {
+        if (!timeline.bubbleKindOk(kind)) return false;
+        for (self.muted()) |*m| if (std.mem.eql(u8, m.kind(), kind)) return true;
+        if (self.mutes_len == max_mutes) return false;
+        var m: Mute = .{ .len = @intCast(kind.len), .buf = undefined };
+        @memcpy(m.buf[0..kind.len], kind);
+        self.mutes[self.mutes_len] = m;
+        self.mutes_len += 1;
+        return true;
+    }
 
     pub fn shownMoments(self: *const NativeState) []const Moment {
         return self.moments[0..self.moments_len];
@@ -109,6 +148,7 @@ pub const NativeState = struct {
                 }
             },
             .shown_moment => |m| _ = self.addShownMoment(m.name, m.value),
+            .mute => |kind| _ = self.addMute(kind),
         }
     }
 
@@ -163,6 +203,12 @@ pub const NativeState = struct {
             }
             try s.endArray();
         }
+        if (self.mutes_len > 0) {
+            try s.objectField("mutes");
+            try s.beginArray();
+            for (self.muted()) |*m| try s.write(m.kind());
+            try s.endArray();
+        }
         try s.endObject();
         try w.writeByte('\n');
     }
@@ -177,6 +223,8 @@ pub const Change = union(enum) {
     launch_at_login: bool,
     position: struct { x: f64, y: f64 },
     shown_moment: struct { name: MomentName, value: []const u8 },
+    /// A bubble kind switched off offline (bubble `mute` button).
+    mute: []const u8,
 };
 
 /// Field by field, like parseNativeState: an invalid field is skipped,
@@ -222,6 +270,11 @@ pub fn parse(scratch: std.mem.Allocator, bytes: []const u8) NativeState {
             if (name != .string or value != .string) continue;
             const n = std.meta.stringToEnum(MomentName, name.string) orelse continue;
             _ = st.addShownMoment(n, value.string);
+        }
+    };
+    if (o.get("mutes")) |x| if (x == .array) {
+        for (x.array.items) |item| {
+            if (item == .string) _ = st.addMute(item.string);
         }
     };
     return st;
@@ -330,6 +383,40 @@ test "encode: only the fields that changed, in the reader's shape" {
     st.apply(.{ .quiet_until = null });
     try testing.expect(std.mem.indexOf(u8, st.encode(&buf, now).?, "\"quietUntil\": null") != null);
     try testing.expectEqual(timeline.QuietOverride.off, st.quietOverride().?);
+}
+
+test "mutes: deduplicated, bubble kinds only, round-tripped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var st: NativeState = .{};
+    st.apply(.{ .mute = "fact" });
+    st.apply(.{ .mute = "fact" });
+    st.apply(.{ .mute = "calendar" });
+    try testing.expect(!st.addMute("Fact!"));
+    try testing.expect(!st.addMute(""));
+    try testing.expectEqual(@as(usize, 2), st.muted().len);
+    st.apply(.{ .shown_moment = .{ .name = .lastGreetingKey, .value = "2026-11-07:evening" } });
+    var buf: [max_file_bytes]u8 = undefined;
+    const now = try timeline.parseIso("2026-11-07T12:00:00Z");
+    const text = st.encode(&buf, now).?;
+    try testing.expect(std.mem.indexOf(u8, text,
+        \\  "mutes": [
+        \\    "fact",
+        \\    "calendar"
+        \\  ]
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"name\": \"lastGreetingKey\"") != null);
+    const back = parse(arena.allocator(), text);
+    try testing.expectEqual(@as(usize, 2), back.muted().len);
+    try testing.expectEqualStrings("calendar", back.muted()[1].kind());
+    try testing.expectEqual(MomentName.lastGreetingKey, back.shownMoments()[0].name);
+    // Bad entries are skipped one by one; a full list refuses more.
+    const mixed = parse(arena.allocator(), "{\"v\":1,\"mutes\":[\"rate\",7,\"NOPE\",\"rate\",\"greeting\"]}");
+    try testing.expectEqual(@as(usize, 2), mixed.muted().len);
+    var full: NativeState = .{};
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" }) |k| try testing.expect(full.addMute(k));
+    try testing.expect(!full.addMute("i"));
+    try testing.expect(full.addMute("a"));
 }
 
 test "moments: capped at 32, oldest dropped; bad values refused" {

@@ -4,8 +4,24 @@
 //! timeline Electron compiled before it quit: desktop/src/pets/timeline.mjs
 //! in the tif1ai repo runs the real controller on a virtual clock for the
 //! next 7 days and writes every render it would have made to
-//! `userData/pet-timeline.json` (v1). Nothing here decides behaviour; this
-//! file only validates the document and answers "what shows at `now`".
+//! `userData/pet-timeline.json` (v1 or v2). Nothing here decides behaviour;
+//! this file only validates the document and answers "what shows at `now`".
+//!
+//! v2 (round 3; Electron writes it only to a pet whose `ready.caps` has
+//! `timeline-v2`) adds, all optional with the v1 meaning when missing:
+//!   entries[]: motion ('roam'|'dash'|null), sleeping (bool),
+//!              bubbleActions ({ id, label }[] | null, at most 3),
+//!              bubbleKind (string | null: 'fact', 'rate', 'result',
+//!              'greeting', 'calendar', 'celebrate' — what `mute` silences),
+//!              secondAnim ({ state, row, frames, durationMs, once, still,
+//!              playKey, delayMs? } | null), states 'look-a' / 'look-b'
+//!   panel:     { lines?: string[], countdown?: bool, actions: { id, label,
+//!              target: string|null, from?: ISO|null, until?: ISO|null }[] }
+//!              | null — the click panel while Electron is gone; the
+//!              countdown line on top is computed here like the hover text
+//!   moment.name 'lastGreetingKey' (race-weekend greetings)
+//! A v1 reader rejects v2 (UnsupportedVersion), so Electron must keep
+//! writing v1 for an older pet.
 //!
 //! On top of the compiled entries it applies the one thing the user can
 //! change natively: Quiet. A quiet window (from pet-native-state.json, set
@@ -25,7 +41,10 @@ const protocol = @import("protocol.zig");
 const sprite = @import("sprite.zig");
 const countdown = @import("countdown.zig");
 
-pub const timeline_version: i64 = 1;
+pub const timeline_version: i64 = 2;
+/// Oldest document version still played (v1 = no round-3 fields).
+pub const min_timeline_version: i64 = 1;
+pub const max_bubble_kind_bytes: usize = 24;
 pub const file_name = "pet-timeline.json";
 pub const max_file_bytes: usize = 1024 * 1024;
 pub const max_play_key_bytes: usize = 128;
@@ -55,7 +74,7 @@ pub const Error = error{
 /// A once-only marker (settings MARKER_SETTINGS) an entry's bubble stands
 /// for. Report it (state.zig `addShownMoment`) only when the entry was
 /// really on screen, so Electron neither repeats nor loses it.
-pub const MomentName = enum { lastResultKey, lastRateKey, lastFactDay };
+pub const MomentName = enum { lastResultKey, lastRateKey, lastFactDay, lastGreetingKey };
 
 pub const Moment = struct {
     name: MomentName,
@@ -69,7 +88,7 @@ pub const SessionReactions = enum { calm, lively, off };
 pub const Entry = struct {
     at_ms: i64,
     visible: bool,
-    state: sprite.State = .idle,
+    state: protocol.State = .idle,
     row: u8 = idle_row,
     frames: u8 = idle_frames,
     duration_ms: u32 = idle_duration_ms,
@@ -83,6 +102,13 @@ pub const Entry = struct {
     /// Both pets on screen.
     duo: bool = false,
     moment: ?Moment = null,
+    // --- v2 ---
+    motion: ?protocol.Motion = null,
+    sleeping: bool = false,
+    bubble_actions: []const protocol.Action = &.{},
+    /// The bubble's kind (BUBBLE_KINDS), for the offline `mute` button.
+    bubble_kind: ?[]const u8 = null,
+    second_anim: ?protocol.Anim = null,
 
     /// The same shape as a live `render` message, so playback and live mode
     /// can share one drawing path. Null for hidden entries.
@@ -101,8 +127,38 @@ pub const Entry = struct {
             .size = tl.size,
             .atlas = first,
             .second = if (self.duo) tl.pets.second else null,
+            .motion = self.motion,
+            .sleeping = self.sleeping,
+            .bubble_actions = self.bubble_actions,
+            .second_anim = if (self.duo) self.second_anim else null,
         };
     }
+};
+
+/// One click-panel button while Electron is gone: `target` opens the app
+/// on that path (`--pets-open=`), null = no offline action. Shown only
+/// inside [from, until) when those are set (the rate nudge's window).
+pub const PanelAction = struct {
+    id: []const u8,
+    label: []const u8,
+    target: ?[]const u8 = null,
+    from_ms: ?i64 = null,
+    until_ms: ?i64 = null,
+
+    pub fn shownAt(self: PanelAction, now_ms: i64) bool {
+        if (self.from_ms) |from| if (now_ms < from) return false;
+        if (self.until_ms) |until| if (now_ms >= until) return false;
+        return true;
+    }
+};
+
+/// The click panel as compiled at hand-off (v2 `panel`).
+pub const Panel = struct {
+    /// Static lines (the latest result), shown under the countdown.
+    lines: []const []const u8 = &.{},
+    /// Put the hover countdown line on top.
+    countdown: bool = true,
+    actions: []const PanelAction = &.{},
 };
 
 pub const Pets = struct {
@@ -146,6 +202,8 @@ pub const Timeline = struct {
     /// False when the file names a countdown format this pet does not know:
     /// no hover countdown then (the duo line still works).
     countdown_v1: bool,
+    /// v2: the click panel (null = clicks only jump, as in v1).
+    panel: ?Panel = null,
     quiet: QuietOverride = .none,
 
     pub fn deinit(self: *Timeline) void {
@@ -211,6 +269,11 @@ pub const Timeline = struct {
             entry.bubble = null;
             entry.bubble_target = null;
             entry.moment = null;
+            // Quiet also stops the walk and the duo's own reactions.
+            entry.motion = null;
+            entry.bubble_actions = &.{};
+            entry.bubble_kind = null;
+            entry.second_anim = null;
         }
         return entry;
     }
@@ -271,6 +334,14 @@ pub const Timeline = struct {
         const text = countdown.hoverText(buf, self.sessions, now_ms) orelse return null;
         return .{ .text = text, .target = self.calendar_target };
     }
+
+    /// The panel's countdown line at `now_ms` (the hover countdown, quiet
+    /// or not: the panel is the user's own click), or null.
+    pub fn panelCountdown(self: *const Timeline, buf: []u8, now_ms: i64) ?[]const u8 {
+        const panel = self.panel orelse return null;
+        if (!panel.countdown or !self.countdown_v1) return null;
+        return countdown.hoverText(buf, self.sessions, now_ms);
+    }
 };
 
 // ------------------------------------------------------------- loading
@@ -307,7 +378,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, user_data_dir: []const u
     const obj = object(root) orelse return error.InvalidTimeline;
 
     const v = int(obj, "v") orelse return error.InvalidTimeline;
-    if (v != timeline_version) return error.UnsupportedVersion;
+    if (v < min_timeline_version or v > timeline_version) return error.UnsupportedVersion;
 
     var tl: Timeline = .{
         .arena = std.heap.ArenaAllocator.init(gpa),
@@ -406,7 +477,92 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, user_data_dir: []const u
         const o = object(value) orelse return error.InvalidTimeline;
         tl.countdown_v1 = std.mem.eql(u8, str(o, "format") orelse "", "v1");
     }
+    tl.panel = try parsePanel(a, obj.get("panel"));
     return tl;
+}
+
+fn parsePanel(a: std.mem.Allocator, value: ?std.json.Value) Error!?Panel {
+    const o = switch (value orelse return null) {
+        .null => return null,
+        .object => |o| o,
+        else => return error.InvalidTimeline,
+    };
+    var panel: Panel = .{};
+    switch (o.get("lines") orelse std.json.Value.null) {
+        .null => {},
+        .array => |raw| {
+            if (raw.items.len > protocol.max_panel_lines) return error.InvalidTimeline;
+            const lines = try a.alloc([]const u8, raw.items.len);
+            for (raw.items, lines) |item, *line| {
+                const text = switch (item) {
+                    .string => |t| t,
+                    else => return error.InvalidTimeline,
+                };
+                if (text.len == 0) return error.InvalidTimeline;
+                line.* = try a.dupe(u8, clipUtf8(text, protocol.max_panel_line_bytes));
+            }
+            panel.lines = lines;
+        },
+        else => return error.InvalidTimeline,
+    }
+    switch (o.get("countdown") orelse std.json.Value.null) {
+        .null => {},
+        .bool => |b| panel.countdown = b,
+        else => return error.InvalidTimeline,
+    }
+    const raw_actions = array(o.get("actions") orelse return error.InvalidTimeline) orelse return error.InvalidTimeline;
+    if (raw_actions.len > protocol.max_panel_actions) return error.InvalidTimeline;
+    const actions = try a.alloc(PanelAction, raw_actions.len);
+    for (raw_actions, actions) |raw, *action| {
+        const ao = object(raw) orelse return error.InvalidTimeline;
+        const id = str(ao, "id") orelse return error.InvalidTimeline;
+        if (!protocol.actionIdOk(id)) return error.InvalidTimeline;
+        const label = str(ao, "label") orelse return error.InvalidTimeline;
+        if (label.len == 0) return error.InvalidTimeline;
+        const target = try optionalStr(ao, "target");
+        if (target) |t| if (!protocol.appPathOk(t)) return error.InvalidTimeline;
+        action.* = .{
+            .id = try a.dupe(u8, id),
+            .label = try a.dupe(u8, clipUtf8(label, protocol.max_action_label_bytes)),
+            .target = if (target) |t| try a.dupe(u8, t) else null,
+            .from_ms = try optionalIso(ao, "from"),
+            .until_ms = try optionalIso(ao, "until"),
+        };
+    }
+    panel.actions = actions;
+    return panel;
+}
+
+fn optionalIso(o: std.json.ObjectMap, key: []const u8) Error!?i64 {
+    const s = try optionalStr(o, key) orelse return null;
+    return parseIso(s) catch error.InvalidTimeline;
+}
+
+/// `[{ id, label }]` or null (v2 `bubbleActions`), at most three.
+fn parseEntryActions(a: std.mem.Allocator, value: ?std.json.Value) Error![]const protocol.Action {
+    const raw = switch (value orelse return &.{}) {
+        .null => return &.{},
+        .array => |arr| arr.items,
+        else => return error.InvalidTimeline,
+    };
+    if (raw.len > protocol.max_bubble_actions) return error.InvalidTimeline;
+    const out = try a.alloc(protocol.Action, raw.len);
+    for (raw, out) |item, *action| {
+        const o = object(item) orelse return error.InvalidTimeline;
+        const id = str(o, "id") orelse return error.InvalidTimeline;
+        if (!protocol.actionIdOk(id)) return error.InvalidTimeline;
+        const label = str(o, "label") orelse return error.InvalidTimeline;
+        if (label.len == 0) return error.InvalidTimeline;
+        action.* = .{ .id = try a.dupe(u8, id), .label = try a.dupe(u8, clipUtf8(label, protocol.max_action_label_bytes)) };
+    }
+    return out;
+}
+
+/// v2 `bubbleKind`: a BUBBLE_KINDS name (`[a-z-]`, ≤ 24 bytes) or null.
+pub fn bubbleKindOk(kind: []const u8) bool {
+    if (kind.len == 0 or kind.len > max_bubble_kind_bytes) return false;
+    for (kind) |c| if (!((c >= 'a' and c <= 'z') or c == '-')) return false;
+    return true;
 }
 
 fn parseSprite(a: std.mem.Allocator, value: ?std.json.Value, user_data_dir: []const u8) Error!?protocol.Sprite {
@@ -431,7 +587,7 @@ fn parseEntry(a: std.mem.Allocator, raw: std.json.Value) Error!Entry {
     const visible = boolean(o, "visible") orelse return error.InvalidTimeline;
     if (!visible) return .{ .at_ms = at_ms, .visible = false };
 
-    const state = std.meta.stringToEnum(sprite.State, str(o, "state") orelse return error.InvalidTimeline) orelse
+    const state = std.meta.stringToEnum(protocol.State, str(o, "state") orelse return error.InvalidTimeline) orelse
         return error.InvalidTimeline;
     const row = int(o, "row") orelse return error.InvalidTimeline;
     const frames = int(o, "frames") orelse return error.InvalidTimeline;
@@ -462,6 +618,40 @@ fn parseEntry(a: std.mem.Allocator, raw: std.json.Value) Error!Entry {
         (if (b.len == 0) null else try a.dupe(u8, clipUtf8(b, protocol.max_text_bytes)))
     else
         null;
+
+    // v2 (strict like the rest: an unknown motion or pose is a skew).
+    const motion: ?protocol.Motion = switch (o.get("motion") orelse std.json.Value.null) {
+        .null => null,
+        .string => |m| std.meta.stringToEnum(protocol.Motion, m) orelse return error.InvalidTimeline,
+        else => return error.InvalidTimeline,
+    };
+    const sleeping = switch (o.get("sleeping") orelse std.json.Value.null) {
+        .null => false,
+        .bool => |b| b,
+        else => return error.InvalidTimeline,
+    };
+    const actions = try parseEntryActions(a, o.get("bubbleActions"));
+    const kind = try optionalStr(o, "bubbleKind");
+    if (kind) |k| if (!bubbleKindOk(k)) return error.InvalidTimeline;
+    const second_anim: ?protocol.Anim = switch (o.get("secondAnim") orelse std.json.Value.null) {
+        .null => null,
+        .object => blk: {
+            const parsed = protocol.parseAnim(o.get("secondAnim")) catch return error.InvalidTimeline;
+            const anim = parsed orelse return error.InvalidTimeline; // unknown pose
+            if (anim.play_key.len > max_play_key_bytes) return error.InvalidTimeline;
+            break :blk .{
+                .state = anim.state,
+                .row = anim.row,
+                .frames = anim.frames,
+                .duration_ms = anim.duration_ms,
+                .once = anim.once,
+                .still = anim.still,
+                .play_key = try a.dupe(u8, anim.play_key),
+                .delay_ms = anim.delay_ms,
+            };
+        },
+        else => return error.InvalidTimeline,
+    };
     return .{
         .at_ms = at_ms,
         .visible = true,
@@ -476,6 +666,11 @@ fn parseEntry(a: std.mem.Allocator, raw: std.json.Value) Error!Entry {
         .bubble_target = if (bubble_text != null and target != null) try a.dupe(u8, target.?) else null,
         .duo = boolean(o, "duo") orelse return error.InvalidTimeline,
         .moment = if (bubble_text != null) moment else null,
+        .motion = motion,
+        .sleeping = sleeping,
+        .bubble_actions = if (bubble_text != null) actions else &.{},
+        .bubble_kind = if (bubble_text != null and kind != null) try a.dupe(u8, kind.?) else null,
+        .second_anim = second_anim,
     };
 }
 
@@ -791,7 +986,7 @@ test "weekend fixture: header, sprites, entries" {
 
     // Lights out holds the jump, then waiting with the bubble.
     const lights = tl.entryAt(at("2026-11-08T17:00:00.500Z")).?;
-    try testing.expectEqual(sprite.State.jumping, lights.state);
+    try testing.expectEqual(protocol.State.jumping, lights.state);
     try testing.expect(lights.once);
     try testing.expectEqualStrings("calendar:2026_20_race:live", lights.play_key);
     try testing.expectEqualStrings("Lights out! \u{b7} S\u{e3}o Paulo GP", lights.bubble.?);
@@ -826,7 +1021,7 @@ test "quiet overlay: native quiet wins, no bubble, no moment" {
     const lights_at = at("2026-11-08T17:00:00.500Z");
     tl.setQuietUntil(at("2026-11-08T19:00:00Z"));
     const quiet = tl.entryAt(lights_at).?;
-    try testing.expectEqual(sprite.State.idle, quiet.state);
+    try testing.expectEqual(protocol.State.idle, quiet.state);
     try testing.expectEqual(@as(u8, 0), quiet.row);
     try testing.expectEqual(@as(u8, 6), quiet.frames);
     try testing.expect(!quiet.once and quiet.bubble == null and quiet.bubble_target == null and quiet.moment == null);
@@ -841,7 +1036,7 @@ test "quiet overlay: native quiet wins, no bubble, no moment" {
     try testing.expect(tl.hover(&buf, lights_at, true) == null);
     // Quiet off: the compiled entry again.
     tl.setQuietUntil(null);
-    try testing.expectEqual(sprite.State.jumping, tl.entryAt(lights_at).?.state);
+    try testing.expectEqual(protocol.State.jumping, tl.entryAt(lights_at).?.state);
 }
 
 test "quiet compiled into the file; native 'off' overrides it" {
@@ -897,7 +1092,8 @@ test "rejects: version, times, order, paths, poses, size" {
 
     const Case = struct { find: []const u8, replace: []const u8, err: Error };
     const cases = [_]Case{
-        .{ .find = "\"v\": 1,", .replace = "\"v\": 2,", .err = error.UnsupportedVersion },
+        .{ .find = "\"v\": 1,", .replace = "\"v\": 3,", .err = error.UnsupportedVersion },
+        .{ .find = "\"v\": 1,", .replace = "\"v\": 0,", .err = error.UnsupportedVersion },
         .{ .find = "\"until\": \"2026-11-14T12:00:00.000Z\"", .replace = "\"until\": \"next week\"", .err = error.InvalidTimeline },
         .{ .find = "\"until\": \"2026-11-14T12:00:00.000Z\"", .replace = "\"until\": \"2026-11-07T11:00:00.000Z\"", .err = error.InvalidTimeline },
         .{ .find = "\"at\": \"2026-11-07T12:10:00.000Z\"", .replace = "\"at\": \"2026-11-07T11:10:00.000Z\"", .err = error.InvalidTimeline },
@@ -928,6 +1124,190 @@ test "rejects: version, times, order, paths, poses, size" {
     const extra = try std.mem.concat(a, u8, &.{ "{\"future\": [1, 2],", good[1..] });
     var tl = try parse(testing.allocator, extra, fixture_user_data);
     tl.deinit();
+}
+
+test "v2 fixture: motion, sleep, look rows, bubble buttons, greeting moment, duo reaction, panel" {
+    // tests/fixtures/timeline-v2.json is emitted by the desktop side
+    // (emit-native-fixtures.mjs): the São Paulo weekend for a round-3 pet.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bytes = try readFixture(arena.allocator(), "timeline-v2.json");
+    var tl = try parse(testing.allocator, bytes, fixture_user_data);
+    defer tl.deinit();
+    try testing.expectEqual(@as(u8, 11), tl.pets.first.?.rows);
+    try testing.expectEqual(@as(u8, 9), tl.pets.second.?.rows);
+
+    // The daily fact at hand-off, with its three buttons.
+    const fact = tl.entryAt(at("2026-11-07T12:00:01Z")).?;
+    try testing.expectEqualStrings("fact", fact.bubble_kind.?);
+    try testing.expectEqual(MomentName.lastFactDay, fact.moment.?.name);
+    try testing.expectEqual(@as(usize, 3), fact.bubble_actions.len);
+    try testing.expectEqualStrings("ok", fact.bubble_actions[0].id);
+    try testing.expectEqualStrings("mute", fact.bubble_actions[2].id);
+    try testing.expectEqualStrings("No daily facts", fact.bubble_actions[2].label);
+    try testing.expect(fact.motion == null);
+    // render() carries the v2 fields like a live payload.
+    try testing.expectEqual(@as(usize, 3), fact.render(&tl).?.bubble_actions.len);
+
+    // Then it roams; no bubble, no buttons, no kind.
+    const roam = tl.entryAt(at("2026-11-07T12:01:00Z")).?;
+    try testing.expectEqual(protocol.Motion.roam, roam.motion.?);
+    try testing.expect(!roam.sleeping and roam.bubble_actions.len == 0 and roam.bubble_kind == null);
+
+    // A look on the 11-row pet; its 9-row partner plays idle (its own anim).
+    const look = tl.entryAt(at("2026-11-07T12:04:00.500Z")).?;
+    try testing.expectEqual(protocol.State.@"look-a", look.state);
+    try testing.expectEqual(@as(u8, 9), look.row);
+    try testing.expectEqual(protocol.State.idle, look.second_anim.?.state);
+    try testing.expectEqual(@as(u8, 0), look.second_anim.?.row);
+    const look_b = tl.entryAt(at("2026-11-07T12:08:00.500Z")).?;
+    try testing.expectEqual(@as(u8, 10), look_b.row);
+
+    // The duo waves: the partner answers 700 ms later.
+    const wave = tl.entryAt(at("2026-11-07T12:05:00.300Z")).?;
+    try testing.expectEqual(protocol.State.waving, wave.state);
+    try testing.expectEqual(protocol.State.waving, wave.second_anim.?.state);
+    try testing.expectEqual(@as(u32, 700), wave.second_anim.?.delay_ms);
+    try testing.expect(wave.second_anim.?.once);
+    try testing.expectEqualStrings("duo-wave:1794053100000:second", wave.second_anim.?.play_key);
+
+    // Asleep 30 min after hand-off: still idle, no walk.
+    const asleep = tl.entryAt(at("2026-11-07T13:00:00Z")).?;
+    try testing.expect(asleep.sleeping and asleep.still and asleep.motion == null);
+    try testing.expectEqual(protocol.State.idle, asleep.state);
+
+    // The evening greeting keeps its marker and its "No greetings" button.
+    const greeting = tl.entryAt(at("2026-11-07T17:00:01Z")).?;
+    try testing.expectEqual(MomentName.lastGreetingKey, greeting.moment.?.name);
+    try testing.expectEqualStrings("2026-11-07:evening", greeting.moment.?.value);
+    try testing.expectEqualStrings("greeting", greeting.bubble_kind.?);
+    try testing.expectEqualStrings("No greetings", greeting.bubble_actions[2].label);
+    try testing.expect(!greeting.sleeping);
+
+    // Qualifying starts: jump, then the dash under the bubble.
+    const jump = tl.entryAt(at("2026-11-07T18:00:00.500Z")).?;
+    try testing.expectEqual(protocol.State.jumping, jump.state);
+    try testing.expect(jump.motion == null);
+    const dash = tl.entryAt(at("2026-11-07T18:00:01Z")).?;
+    try testing.expectEqual(protocol.Motion.dash, dash.motion.?);
+    try testing.expectEqualStrings("calendar", dash.bubble_kind.?);
+    try testing.expectEqualStrings("quiet-session", dash.bubble_actions[1].id);
+    try testing.expectEqualStrings("No session alerts", dash.bubble_actions[2].label);
+
+    // Quiet: no walk, no buttons, no duo reaction (sleep stays).
+    tl.setQuietUntil(at("2026-11-07T23:00:00Z"));
+    const quiet = tl.entryAt(at("2026-11-07T18:00:01Z")).?;
+    try testing.expect(quiet.motion == null and quiet.bubble_actions.len == 0 and quiet.bubble_kind == null);
+    try testing.expect(tl.entryAt(at("2026-11-07T12:05:00.300Z")).?.second_anim == null);
+    try testing.expect(tl.entryAt(at("2026-11-07T13:00:00Z")).?.sleeping);
+    tl.setQuietUntil(null);
+    try testing.expect(tl.entryAt(at("2026-11-07T12:05:00.300Z")).?.second_anim != null);
+
+    // The static panel: the countdown on top is computed here, then the
+    // compiled line; the rate button only inside the race's window.
+    const panel = tl.panel.?;
+    try testing.expect(panel.countdown);
+    try testing.expectEqual(@as(usize, 1), panel.lines.len);
+    try testing.expectEqualStrings("Lando Norris won the Mexico City GP", panel.lines[0]);
+    try testing.expectEqual(@as(usize, 5), panel.actions.len);
+    try testing.expectEqualStrings("/desktop/ask", panel.actions[0].target.?);
+    try testing.expectEqualStrings("/settings/pets", panel.actions[4].target.?);
+    var buf: [countdown.max_text_bytes]u8 = undefined;
+    try testing.expectEqualStrings(
+        "Qualifying in 2 h 14 min \u{b7} S\u{e3}o Paulo GP",
+        tl.panelCountdown(&buf, at("2026-11-07T15:46:00Z")).?,
+    );
+    const rate = panel.actions[1];
+    try testing.expectEqualStrings("rate", rate.id);
+    try testing.expectEqualStrings("/rate/2026/sao-paulo/race", rate.target.?);
+    try testing.expect(!rate.shownAt(at("2026-11-08T19:59:59Z")));
+    try testing.expect(rate.shownAt(at("2026-11-08T20:00:00Z")));
+    try testing.expect(!rate.shownAt(at("2026-11-10T19:00:00Z")));
+    try testing.expect(panel.actions[0].shownAt(at("2030-01-01T00:00:00Z")));
+}
+
+test "v1 documents still play: no panel, nothing new on entries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bytes = try readFixture(arena.allocator(), "timeline-weekend.json");
+    var tl = try parse(testing.allocator, bytes, fixture_user_data);
+    defer tl.deinit();
+    try testing.expect(tl.panel == null);
+    var buf: [countdown.max_text_bytes]u8 = undefined;
+    try testing.expect(tl.panelCountdown(&buf, at("2026-11-07T15:46:00Z")) == null);
+    for (tl.entries) |e| {
+        try testing.expect(e.motion == null and !e.sleeping and e.bubble_actions.len == 0);
+        try testing.expect(e.bubble_kind == null and e.second_anim == null);
+    }
+}
+
+test "v2 rejects: unknown motion / pose, bad buttons, bad panel" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const good = try readFixture(a, "timeline-v2.json");
+    // Each case edits the first occurrence of `find` in the emitted file.
+    const Case = struct { find: []const u8, replace: []const u8 };
+    const cases = [_]Case{
+        .{ .find = "\"motion\": \"roam\"", .replace = "\"motion\": \"fly\"" },
+        .{ .find = "\"motion\": \"dash\"", .replace = "\"motion\": true" },
+        .{ .find = "\"sleeping\": true", .replace = "\"sleeping\": \"yes\"" },
+        .{ .find = "\"state\": \"look-a\"", .replace = "\"state\": \"look-c\"" },
+        // A fourth button.
+        .{ .find = "\"bubbleActions\": [\n        {", .replace = "\"bubbleActions\": [\n        { \"id\": \"x\", \"label\": \"x\" },\n        {" },
+        .{ .find = "\"id\": \"ok\"", .replace = "\"id\": \"OK\"" },
+        .{ .find = "\"label\": \"OK\"", .replace = "\"label\": \"\"" },
+        .{ .find = "\"bubbleKind\": \"fact\"", .replace = "\"bubbleKind\": \"Fact!\"" },
+        .{ .find = "\"state\": \"waving\",\n        \"row\": 3", .replace = "\"state\": \"dancing\",\n        \"row\": 3" },
+        .{ .find = "\"delayMs\": 700", .replace = "\"delayMs\": -1" },
+        .{ .find = "\"target\": \"/desktop/ask\"", .replace = "\"target\": \"//evil.example\"" },
+        .{ .find = "\"until\": \"2026-11-10T19:00:00.000Z\"", .replace = "\"until\": \"tomorrow\"" },
+        .{ .find = "\"lines\": [\n      \"Lando Norris won the Mexico City GP\"\n    ]", .replace = "\"lines\": [\"a\", \"b\", \"c\", \"d\"]" },
+        .{ .find = "\"countdown\": true", .replace = "\"countdown\": 1" },
+        .{ .find = "\"name\": \"lastGreetingKey\"", .replace = "\"name\": \"lastHelloKey\"" },
+    };
+    for (cases) |c| {
+        const idx = std.mem.indexOf(u8, good, c.find) orelse {
+            std.debug.print("fixture text not found: {s}\n", .{c.find});
+            return error.TestFixtureChanged;
+        };
+        const bad = try std.mem.concat(a, u8, &.{ good[0..idx], c.replace, good[idx + c.find.len ..] });
+        if (parse(testing.allocator, bad, fixture_user_data)) |accepted| {
+            var tl = accepted;
+            tl.deinit();
+            std.debug.print("accepted: {s} -> {s}\n", .{ c.find, c.replace });
+            return error.TestExpectedError;
+        } else |err| try testing.expectEqual(error.InvalidTimeline, err);
+    }
+    // A v1 reader's version gate is what keeps v2 away from an older pet.
+    const v3 = try std.mem.replaceOwned(u8, a, good, "\"v\": 2,", "\"v\": 3,");
+    try testing.expectError(error.UnsupportedVersion, parse(testing.allocator, v3, fixture_user_data));
+}
+
+test "v2 fixture never crashes when truncated or bit-flipped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const good = try readFixture(a, "timeline-v2.json");
+    var len: usize = 0;
+    while (len < good.len) : (len += 29) {
+        if (parse(testing.allocator, good[0..len], fixture_user_data)) |tl| {
+            var t = tl;
+            t.deinit();
+        } else |_| {}
+    }
+    var prng = std.Random.DefaultPrng.init(0x7632);
+    const copy = try a.dupe(u8, good);
+    var round: usize = 0;
+    while (round < 300) : (round += 1) {
+        @memcpy(copy, good);
+        const at_byte = prng.random().uintLessThan(usize, copy.len);
+        copy[at_byte] ^= @as(u8, 1) << prng.random().int(u3);
+        if (parse(testing.allocator, copy, fixture_user_data)) |tl| {
+            var t = tl;
+            t.deinit();
+        } else |_| {}
+    }
 }
 
 test "load: file inside --user-data only" {

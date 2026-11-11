@@ -12,6 +12,13 @@
 //!  3. Neither (started by hand with `--pet`): idle, plus the same local
 //!     interactions.
 //!
+//! Round 3 (both drivers): a second animation track for the duo partner
+//! (`secondAnim`, with its start delay), the v2 look-around rows, walking
+//! (`motion`, motion.zig), the sleeping "z z" mark, the answer-ready badge,
+//! buttons under the bubble and the click panel. While Electron drives, the
+//! buttons only report (`bubbleAction` / `panelAction` events); offline the
+//! pet answers them from the timeline (ok, quiet, mute, panel targets).
+//!
 //! No agent hooks, no :7777 server, no ~/.petdex or ~/.codex scanning, no
 //! updater, no settings window: those stay in packages/petdex-desktop-native.
 
@@ -24,6 +31,7 @@ const protocol = @import("protocol.zig");
 // Same API on both: a Unix socket on POSIX, a named pipe on Windows.
 const ipc = if (builtin.os.tag == .windows) @import("pipe_windows.zig") else @import("ipc.zig");
 const core = @import("core.zig");
+const motion = @import("motion.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -31,7 +39,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 const is_linux = builtin.target.os.tag == .linux;
 
-pub const State = sprite.State;
+pub const State = protocol.State;
 
 const canvas_label = "pet-canvas";
 const frame_w: f32 = 192;
@@ -49,6 +57,11 @@ const second_image_base: u64 = 9;
 const frame_timer_key: u64 = 1;
 const poll_timer_key: u64 = 2;
 const drag_watchdog_key: u64 = 3;
+/// The duo partner's own animation (`secondAnim`) and its start delay.
+const frame2_timer_key: u64 = 4;
+/// Walking (motion.zig): one-shot pauses and 34 ms steps, only while a
+/// motion is on.
+const walk_timer_key: u64 = 5;
 /// Socket mailbox poll: fast while Electron is connected (its renders
 /// should land within a frame or two), slow otherwise (timeline entries
 /// and local reactions only need ~1 s). Each wake costs ~0.13 % CPU.
@@ -62,6 +75,19 @@ const hover_bubble_ms: i64 = 6000;
 const double_click_ms: i64 = 400;
 const tap_max_ms: i64 = 400;
 const tap_slop_px: f64 = 3;
+/// The click panel closes after this long without the pointer on the pet
+/// or the panel (SPEC 3a).
+const panel_idle_ms: i64 = 20_000;
+/// No roaming for this long after a hover, click or drag (behaviour.mjs
+/// gates roam the same way; while Electron drives this only bridges the
+/// time until its next render).
+const roam_after_interaction_ms: i64 = 30_000;
+/// Offline, an interaction keeps a sleeping timeline entry awake this long
+/// (AMBIENT_SLEEP_MS): the timeline was compiled with nobody touching it.
+const awake_after_interaction_ms: i64 = 30 * 60 * 1000;
+/// Linux reports pointer enter / leave for the pet and its bubble / panel
+/// alike: a re-enter this soon after a leave is the same hover.
+const hover_regrace_ms: i64 = 400;
 
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
 const shell_views = [_]native_sdk.ShellView{
@@ -101,6 +127,8 @@ fn appLaunch() core.AppLaunch {
 
 pub const Msg = union(enum) {
     frame_tick: native_sdk.EffectTimer,
+    frame2_tick: native_sdk.EffectTimer,
+    walk_tick: native_sdk.EffectTimer,
     poll_tick: native_sdk.EffectTimer,
     drag_watchdog: native_sdk.EffectTimer,
     frame_clock,
@@ -112,29 +140,42 @@ pub const Msg = union(enum) {
     pointer_enter,
     pointer_leave,
     bubble_click,
+    bubble_action: u8,
+    panel_action: u8,
+    escape,
     tray_pick: u8,
     pet_pick: u8,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "drag_watchdog", "frame_clock", "appearance", "native_drag_started", "native_drag_ended", "pointer_click", "pointer_dblclick", "pointer_enter", "pointer_leave", "tray_pick" };
+    pub const view_unbound = .{ "frame_tick", "frame2_tick", "walk_tick", "poll_tick", "drag_watchdog", "frame_clock", "appearance", "native_drag_started", "native_drag_ended", "pointer_click", "pointer_dblclick", "pointer_enter", "pointer_leave", "escape", "tray_pick" };
 };
 
-const PathBuf = struct {
-    buf: [protocol.max_path_bytes]u8 = undefined,
-    len: usize = 0,
+/// A fixed-size UTF-8 string.
+fn Buf(comptime n: usize) type {
+    return struct {
+        buf: [n]u8 = undefined,
+        len: usize = 0,
 
-    fn slice(self: *const PathBuf) []const u8 {
-        return self.buf[0..self.len];
-    }
+        const Self = @This();
 
-    fn set(self: *PathBuf, s: []const u8) bool {
-        const n = @min(s.len, self.buf.len);
-        const changed = !std.mem.eql(u8, self.buf[0..self.len], s[0..n]);
-        @memcpy(self.buf[0..n], s[0..n]);
-        self.len = n;
-        return changed;
-    }
-};
+        fn slice(self: *const Self) []const u8 {
+            return self.buf[0..self.len];
+        }
+
+        /// Copy `s` in (clipped on a code point); true when it changed.
+        fn set(self: *Self, s: []const u8) bool {
+            const t = protocol.clipUtf8(s, n);
+            const changed = !std.mem.eql(u8, self.buf[0..self.len], t);
+            std.mem.copyForwards(u8, self.buf[0..t.len], t);
+            self.len = t.len;
+            return changed;
+        }
+    };
+}
+
+const PathBuf = Buf(protocol.max_path_bytes);
+const KeyBuf = Buf(protocol.max_play_key_bytes);
+const KindBuf = Buf(core.max_bubble_kind_bytes);
 
 const Loaded = struct {
     path: PathBuf = .{},
@@ -142,6 +183,99 @@ const Loaded = struct {
     frames: u8 = 0,
     rows: u8 = 9,
     ok: bool = false,
+};
+
+/// One button (bubble action or panel action).
+const ActionSlot = struct {
+    id: Buf(protocol.max_action_id_bytes) = .{},
+    label: Buf(protocol.max_action_label_bytes) = .{},
+    /// Offline only: the app path a panel button opens (empty = none).
+    target: Buf(512) = .{},
+};
+
+/// An animation a driver asked for, with its own copy of the play key.
+const AnimStore = struct {
+    state: State = .idle,
+    row: u8 = 0,
+    frames: u8 = 6,
+    duration_ms: u32 = 1100,
+    once: bool = false,
+    still: bool = false,
+    delay_ms: u32 = 0,
+    key: KeyBuf = .{},
+
+    fn set(self: *AnimStore, a: protocol.Anim) void {
+        self.state = a.state;
+        self.row = a.row;
+        self.frames = a.frames;
+        self.duration_ms = a.duration_ms;
+        self.once = a.once;
+        self.still = a.still;
+        self.delay_ms = a.delay_ms;
+        _ = self.key.set(a.play_key);
+    }
+
+    fn get(self: *const AnimStore) protocol.Anim {
+        return .{
+            .state = self.state,
+            .row = self.row,
+            .frames = self.frames,
+            .duration_ms = self.duration_ms,
+            .once = self.once,
+            .still = self.still,
+            .play_key = self.key.slice(),
+            .delay_ms = self.delay_ms,
+        };
+    }
+};
+
+/// What one sprite is playing.
+const Track = struct {
+    state: State = .idle,
+    row: u8 = 0,
+    frames: u8 = 6,
+    frame_ms: u32 = 183,
+    once: bool = false,
+    still: bool = false,
+    frame_index: usize = 0,
+    key: KeyBuf = .{},
+    /// Frame 0 holds this long before the animation starts (secondAnim).
+    delay_ms: u32 = 0,
+    delay_pending: bool = false,
+
+    /// Play `a`; true when the animation restarts (new key, pose, row or
+    /// stillness), as the live renderer does.
+    fn take(self: *Track, a: protocol.Anim, reduce_motion: bool) bool {
+        const still = a.still or reduce_motion;
+        const restart = !std.mem.eql(u8, self.key.slice(), a.play_key) or a.state != self.state or
+            a.row != self.row or still != self.still;
+        self.state = a.state;
+        self.row = a.row;
+        self.frames = @max(1, @min(a.frames, 8));
+        self.frame_ms = @max(16, a.duration_ms / self.frames);
+        self.once = a.once;
+        self.still = still;
+        _ = self.key.set(a.play_key);
+        if (restart) {
+            self.frame_index = 0;
+            self.delay_ms = a.delay_ms;
+            self.delay_pending = a.delay_ms > 0 and !still;
+        }
+        if (self.frame_index >= self.frames) self.frame_index = 0;
+        return restart;
+    }
+
+    fn animates(self: *const Track) bool {
+        if (self.still or self.frames <= 1) return false;
+        return !(self.once and self.frame_index + 1 >= self.frames);
+    }
+
+    /// Next frame; false when a one-shot already shows its last.
+    fn advance(self: *Track) bool {
+        if (self.once and self.frame_index + 1 >= self.frames) return false;
+        self.frame_index = (self.frame_index + 1) % self.frames;
+        return true;
+    }
 };
 
 const OfflineSlot = union(enum) {
@@ -183,6 +317,24 @@ const Menu = struct {
     len: usize = 0,
 };
 
+/// The floating window next to the pet: the bubble (with or without
+/// buttons) or the click panel, which replaces the bubble while open.
+const Float = enum {
+    none,
+    bubble,
+    bubble_actions,
+    panel,
+
+    fn label(self: Float) []const u8 {
+        return switch (self) {
+            .none => "",
+            .bubble => "bubble",
+            .bubble_actions => "bubble-actions",
+            .panel => "panel",
+        };
+    }
+};
+
 pub const Model = struct {
     // --- what is shown ---
     /// Electron's show/hide, or Show/Hide pet from the menus offline.
@@ -191,15 +343,23 @@ pub const Model = struct {
     timeline_hidden: bool = false,
     size: protocol.Size = .m,
     duo: bool = false,
-    state: State = .idle,
-    row: u8 = 0,
-    frames: u8 = 6,
-    frame_ms: u32 = 183,
-    once: bool = false,
-    still: bool = false,
-    frame_index: usize = 0,
-    play_key: [128]u8 = undefined,
-    play_key_len: usize = 0,
+    /// What the driver wants the first sprite to play, and the second's
+    /// own animation when it has one (else it mirrors the first).
+    want_anim: AnimStore = .{},
+    want_second_anim: AnimStore = .{},
+    want_second_own: bool = false,
+    /// The two tracks on screen (the walk overlay and the atlas-row
+    /// fallback applied); the second mirrors the first's frames when
+    /// `second_mirrors`.
+    anim: Track = .{},
+    anim2: Track = .{},
+    second_mirrors: bool = true,
+    /// A frame timer is pending for the track (re-armed when the pet is
+    /// shown again with the same animation).
+    timer1_on: bool = false,
+    timer2_on: bool = false,
+    /// Still frame + the "z z" mark (SPEC 2b).
+    sleeping: bool = false,
     first: Loaded = .{},
     second: Loaded = .{},
     /// Paths of the sprites to show (first, second).
@@ -212,6 +372,44 @@ pub const Model = struct {
     /// Where a bubble click leads while no Electron is connected.
     bubble_target: PathBuf = .{},
     bubble_until_ms: i64 = 0,
+    /// Buttons under the bubble (SPEC 2e) and, offline, the bubble's kind
+    /// (what `mute` switches off).
+    bubble_actions: [protocol.max_bubble_actions]ActionSlot = undefined,
+    bubble_actions_len: usize = 0,
+    bubble_kind: KindBuf = .{},
+    /// Answer-ready badge (SPEC 3b; Electron only).
+    badge: bool = false,
+    badge_label: Buf(protocol.max_badge_label_bytes) = .{},
+    /// Click panel (SPEC 3a). Live: Electron's `panel`; offline: the
+    /// timeline's, with the countdown line on top.
+    panel_open: bool = false,
+    panel_lines: [protocol.max_panel_lines + 1]Buf(protocol.max_panel_line_bytes) = undefined,
+    panel_lines_len: usize = 0,
+    panel_actions: [protocol.max_panel_actions]ActionSlot = undefined,
+    panel_actions_len: usize = 0,
+    /// Closes when the pointer has been off the pet and panel until then.
+    panel_deadline_ms: i64 = 0,
+    /// Live: the pet closed Electron's panel itself (20 s, Escape) and
+    /// waits for a render without one before showing the next.
+    panel_dismissed: bool = false,
+    /// Win/mac: the floating window last declared and the height it got.
+    float_shown: Float = .none,
+    float_w_applied: f32 = 0,
+    float_h_applied: f32 = 0,
+    pointer_in_float: bool = false,
+
+    // --- motion (motion.zig) ---
+    /// The driver's `motion` (payload or timeline entry).
+    motion_want: ?protocol.Motion = null,
+    walker: motion.Walker = .{},
+    rng: std.Random.DefaultPrng = .init(0),
+    /// No roam until then (an interaction).
+    roam_block_until_ms: i64 = 0,
+    /// A dash ran in the current dash episode (the driver's motion has
+    /// stayed 'dash' since): no second run after an interruption.
+    dash_spent: bool = false,
+    /// fitWindow changed the size: the walk stops, its edges are stale.
+    resized: bool = false,
 
     // --- driver ---
     /// Electron finished hello.
@@ -223,9 +421,16 @@ pub const Model = struct {
     timeline_entry: ?usize = null,
 
     // --- local reactions (not driven) ---
-    local_state: ?State = null,
+    local_state: ?sprite.State = null,
     local_until_ms: i64 = 0,
     quiet_until_ms: i64 = 0,
+    /// A sleeping entry shows the pet awake until then (an interaction).
+    awake_until_ms: i64 = 0,
+    /// Bubble kinds muted offline (and saved for Electron).
+    mutes: [core.max_mutes]KindBuf = undefined,
+    mutes_len: usize = 0,
+    /// The bubble text the user OK'ed: entries repeating it stay quiet.
+    dismissed: Buf(protocol.max_text_bytes) = .{},
 
     // --- pointer / window ---
     dragging: bool = false,
@@ -235,6 +440,7 @@ pub const Model = struct {
     have_position: bool = false,
     pending_move: ?protocol.Point = null,
     hover_inside: bool = false,
+    pointer_left_ms: i64 = 0,
     press_ms: i64 = 0,
     press_x: f64 = 0,
     press_y: f64 = 0,
@@ -326,6 +532,7 @@ fn fitWindow(model: *Model, fx: *Effects) void {
     model.window_h = h;
     model.window_first_off = firstOffset(model);
     model.window_sprite_w = spriteW(model);
+    model.resized = true;
 }
 
 // ---------------------------------------------------------- sprite frames
@@ -367,11 +574,12 @@ fn registerRow(fx: *Effects, path: []const u8, rows_hint: u8, row: u8, frames: u
     return @intCast(rows);
 }
 
-/// Make the registered frames match what the model wants to show.
+/// Make the registered frames match what the tracks show.
 fn syncFrames(model: *Model, fx: *Effects) void {
-    syncOne(&model.first, &model.want_first, model.want_first_rows, model.row, model.frames, first_image_base, fx);
+    syncOne(&model.first, &model.want_first, model.want_first_rows, model.anim.row, model.anim.frames, first_image_base, fx);
     if (model.duo and model.want_second.len > 0) {
-        syncOne(&model.second, &model.want_second, model.want_second_rows, model.row, model.frames, second_image_base, fx);
+        const t = if (model.second_mirrors) &model.anim else &model.anim2;
+        syncOne(&model.second, &model.want_second, model.want_second_rows, t.row, t.frames, second_image_base, fx);
     } else {
         model.second.ok = false;
     }
@@ -399,43 +607,68 @@ fn syncOne(loaded: *Loaded, want: *const PathBuf, rows: u8, row: u8, frames: u8,
 
 // --------------------------------------------------------- what to show
 
-const Show = struct {
-    state: State,
-    row: u8,
-    frames: u8,
-    duration_ms: u32,
-    once: bool = false,
-    still: bool = false,
-    play_key: []const u8 = "",
-};
-
-/// Upstream's frame table for a state (used for local reactions, where no
-/// payload says how to play it).
-fn localShow(state: State, key: []const u8) Show {
+/// Upstream's frame table for a state (local reactions, the walk and the
+/// row fallback, where no payload says how to play it).
+fn localAnim(state: sprite.State, key: []const u8) protocol.Anim {
     const def = sprite.stateDef(state);
     var total: u32 = 0;
     for (def.frames) |f| total += f.dur_ms;
     const once = state == .jumping or state == .waving or state == .failed;
-    return .{ .state = state, .row = @intCast(def.row), .frames = @intCast(def.frames.len), .duration_ms = total, .once = once, .play_key = key };
+    return .{ .state = .fromSprite(state), .row = @intCast(def.row), .frames = @intCast(def.frames.len), .duration_ms = total, .once = once, .play_key = key };
 }
 
-fn applyShow(model: *Model, show: Show, fx: *Effects) void {
-    const key_changed = !std.mem.eql(u8, model.play_key[0..model.play_key_len], show.play_key);
-    const restart = key_changed or show.state != model.state or show.row != model.row or show.still != model.still;
-    model.state = show.state;
-    model.row = show.row;
-    model.frames = @max(1, @min(show.frames, 8));
-    model.frame_ms = @max(16, show.duration_ms / model.frames);
-    model.once = show.once;
-    model.still = show.still or model.reduce_motion;
-    const n = @min(show.play_key.len, model.play_key.len);
-    @memcpy(model.play_key[0..n], show.play_key[0..n]);
-    model.play_key_len = n;
+/// A row the sheet lacks (v2 look-around on a 9-row sheet) plays idle
+/// (SPEC 4b: also the duo partner's fallback).
+fn fitRows(a: protocol.Anim, rows: u8, key: []const u8) protocol.Anim {
+    if (a.row < rows) return a;
+    var idle = localAnim(.idle, key);
+    idle.still = a.still;
+    return idle;
+}
+
+fn setWant(model: *Model, first: protocol.Anim, second: ?protocol.Anim) void {
+    model.want_anim.set(first);
+    if (second) |s| {
+        model.want_second_anim.set(s);
+        model.want_second_own = true;
+    } else model.want_second_own = false;
+}
+
+/// Put what the driver wants on screen: the walk overlay (both sprites
+/// run), the row fallback per sheet, frames, window size, frame timers.
+fn applyTracks(model: *Model, fx: *Effects) void {
+    var first = model.want_anim.get();
+    var second: ?protocol.Anim = if (model.want_second_own) model.want_second_anim.get() else null;
+    if (model.walker.pose()) |dir| {
+        first = if (dir == .left) localAnim(.@"running-left", "walk:left") else localAnim(.@"running-right", "walk:right");
+        second = null;
+    }
+    first = fitRows(first, model.want_first_rows, "fallback");
+    const restart1 = model.anim.take(first, model.reduce_motion);
+    var mirrors = true;
+    var restart2 = false;
+    if (second) |s| {
+        mirrors = false;
+        restart2 = model.anim2.take(fitRows(s, model.want_second_rows, "fallback:second"), model.reduce_motion);
+    } else if (first.row >= model.want_second_rows) {
+        mirrors = false;
+        restart2 = model.anim2.take(fitRows(first, model.want_second_rows, "fallback:second"), model.reduce_motion);
+    }
+    if (mirrors != model.second_mirrors) restart2 = true;
+    model.second_mirrors = mirrors;
     syncFrames(model, fx);
     fitWindow(model, fx);
-    if (restart) {
-        model.frame_index = 0;
-        armFrameTimer(model, fx);
+    if (restart1 or !model.timer1_on) armFrameTimer(model, fx);
+    if (restart2 or !model.timer2_on) armFrame2Timer(model, fx);
+}
+
+/// applyTracks, then stop a walk the resize made stale (its edges too).
+fn refreshAnim(model: *Model, fx: *Effects) void {
+    applyTracks(model, fx);
+    if (model.resized) {
+        model.resized = false;
+        model.walker.forgetEdges();
+        walk(model, fx, .interrupt);
     }
 }
 
@@ -445,27 +678,81 @@ fn setBubble(model: *Model, text: ?[]const u8, target: ?[]const u8, until_ms: i6
     model.bubble_len = t.len;
     _ = model.bubble_target.set(target orelse "");
     model.bubble_until_ms = until_ms;
+    model.bubble_actions_len = 0;
+    model.bubble_kind.len = 0;
 }
 
-fn armFrameTimer(model: *const Model, fx: *Effects) void {
+/// Buttons for the bubble set just before (none without a bubble).
+fn setBubbleActions(model: *Model, actions: []const protocol.Action, kind: ?[]const u8) void {
+    model.bubble_actions_len = 0;
+    _ = model.bubble_kind.set(kind orelse "");
+    if (model.bubble_len == 0) return;
+    for (actions) |a| {
+        if (model.bubble_actions_len >= model.bubble_actions.len) break;
+        var slot: ActionSlot = .{};
+        _ = slot.id.set(a.id);
+        _ = slot.label.set(a.label);
+        model.bubble_actions[model.bubble_actions_len] = slot;
+        model.bubble_actions_len += 1;
+    }
+}
+
+fn setBadge(model: *Model, badge: ?protocol.Badge) void {
+    model.badge = badge != null;
+    _ = model.badge_label.set(if (badge) |b| b.label else "");
+}
+
+fn armFrameTimer(model: *Model, fx: *Effects) void {
     fx.cancelTimer(frame_timer_key);
-    if (model.still or model.frames <= 1 or !onScreen(model)) return;
-    if (model.once and model.frame_index + 1 >= model.frames) return;
+    model.timer1_on = false;
+    if (!onScreen(model) or !model.anim.animates()) return;
     fx.startTimer(.{
         .key = frame_timer_key,
-        .interval_ms = model.frame_ms,
+        .interval_ms = model.anim.frame_ms,
         .mode = .one_shot,
         .on_fire = Effects.timerMsg(.frame_tick),
     });
+    model.timer1_on = true;
+}
+
+/// The duo partner's own track: its start delay, then its frames.
+fn armFrame2Timer(model: *Model, fx: *Effects) void {
+    fx.cancelTimer(frame2_timer_key);
+    model.timer2_on = false;
+    if (model.second_mirrors or !model.duo or !onScreen(model)) return;
+    const t = &model.anim2;
+    const interval = if (t.delay_pending) t.delay_ms else if (t.animates()) t.frame_ms else return;
+    fx.startTimer(.{
+        .key = frame2_timer_key,
+        .interval_ms = interval,
+        .mode = .one_shot,
+        .on_fire = Effects.timerMsg(.frame2_tick),
+    });
+    model.timer2_on = true;
+}
+
+fn armFrameTimers(model: *Model, fx: *Effects) void {
+    armFrameTimer(model, fx);
+    armFrame2Timer(model, fx);
+}
+
+fn cancelFrameTimers(model: *Model, fx: *Effects) void {
+    fx.cancelTimer(frame_timer_key);
+    fx.cancelTimer(frame2_timer_key);
+    model.timer1_on = false;
+    model.timer2_on = false;
 }
 
 /// Not driven: the timeline entry or idle, unless a local reaction plays.
 fn showUndriven(model: *Model, fx: *Effects) void {
     if (model.driven) return;
     const now = fx.wallMs();
+    defer updateMotion(model, fx);
     if (model.local_state) |state| {
         if (now < model.local_until_ms) {
-            applyShow(model, localShow(state, "local"), fx);
+            setWant(model, localAnim(state, "local"), null);
+            model.sleeping = false;
+            refreshAnim(model, fx);
             return;
         }
         model.local_state = null;
@@ -473,30 +760,33 @@ fn showUndriven(model: *Model, fx: *Effects) void {
     if (model.timeline) |*tl| {
         if (tl.entryAt(now)) |hit| {
             const entry = hit.entry;
+            const quiet = now < model.quiet_until_ms;
             if (model.timeline_entry == null or model.timeline_entry.? != hit.index) {
                 model.timeline_entry = hit.index;
-                const shows = entry.visible and model.visible and now >= model.quiet_until_ms;
-                if (shows) {
-                    setBubble(model, entry.bubble, entry.bubble_target, 0);
-                    // Only a bubble that really showed counts; one eaten by
-                    // quiet or a hidden pet stays unreported so Electron
-                    // shows it again.
-                    if (entry.bubble != null) if (entry.moment) |m| core.recordMoment(args.user_data, m);
-                } else {
-                    setBubble(model, null, null, 0);
-                }
+                applyEntryBubble(model, entry, quiet, now);
             }
             model.timeline_hidden = !entry.visible;
             if (!entry.visible) {
-                fx.cancelTimer(frame_timer_key);
+                setMotionWant(model, null);
+                cancelFrameTimers(model, fx);
                 fitWindow(model, fx);
                 return;
             }
             model.duo = entry.duo;
-            if (now < model.quiet_until_ms) {
-                applyShow(model, localShow(.idle, "quiet"), fx);
+            // An interaction offline wakes a sleeping entry for a while.
+            const asleep = entry.sleeping and now >= model.awake_until_ms;
+            model.sleeping = asleep;
+            if (quiet) {
+                // behaviour.mjs: quiet → idle, no bubbles, no walking.
+                var idle = localAnim(.idle, "quiet");
+                idle.still = asleep or (entry.still and !entry.sleeping);
+                setWant(model, idle, null);
+                setMotionWant(model, null);
+            } else if (entry.sleeping and !asleep) {
+                setWant(model, localAnim(.idle, "awake"), null);
+                setMotionWant(model, null);
             } else {
-                applyShow(model, .{
+                setWant(model, .{
                     .state = entry.state,
                     .row = entry.row,
                     .frames = entry.frames,
@@ -504,12 +794,249 @@ fn showUndriven(model: *Model, fx: *Effects) void {
                     .once = entry.once,
                     .still = entry.still,
                     .play_key = entry.play_key,
-                }, fx);
+                }, if (entry.duo) entry.second_anim else null);
+                setMotionWant(model, entry.motion);
             }
+            refreshAnim(model, fx);
             return;
         }
     }
-    applyShow(model, localShow(.idle, "idle"), fx);
+    setWant(model, localAnim(.idle, "idle"), null);
+    model.sleeping = false;
+    setMotionWant(model, null);
+    refreshAnim(model, fx);
+}
+
+/// A new timeline entry's bubble, once: quiet, a hidden pet, a muted kind
+/// or the bubble the user just OK'ed show none. A hover line still showing
+/// wins (behaviour.mjs ranks hover first); the entry's bubble comes back
+/// when it expires (poll).
+fn applyEntryBubble(model: *Model, entry: core.Entry, quiet: bool, now: i64) void {
+    if (model.bubble_until_ms > now) return;
+    // An open panel holds new bubbles back (and their moments unreported);
+    // closing it applies the entry again.
+    if (model.panel_open) {
+        setBubble(model, null, null, 0);
+        return;
+    }
+    const text = entry.bubble orelse {
+        model.dismissed.len = 0;
+        setBubble(model, null, null, 0);
+        return;
+    };
+    const shows = entry.visible and model.visible and !quiet;
+    const muted = if (entry.bubble_kind) |k| isMuted(model, k) else false;
+    if (!shows or muted or std.mem.eql(u8, model.dismissed.slice(), text)) {
+        setBubble(model, null, null, 0);
+        return;
+    }
+    model.dismissed.len = 0;
+    setBubble(model, text, entry.bubble_target, 0);
+    setBubbleActions(model, entry.bubble_actions, entry.bubble_kind);
+    // Only a bubble that really showed counts; one eaten by quiet or a
+    // hidden pet stays unreported so Electron shows it again.
+    if (entry.moment) |m| core.recordMoment(args.user_data, m);
+}
+
+fn isMuted(model: *const Model, kind: []const u8) bool {
+    for (model.mutes[0..model.mutes_len]) |*m| if (std.mem.eql(u8, m.slice(), kind)) return true;
+    return false;
+}
+
+fn addMute(model: *Model, kind: []const u8) void {
+    if (isMuted(model, kind) or model.mutes_len >= model.mutes.len) return;
+    var m: KindBuf = .{};
+    _ = m.set(kind);
+    model.mutes[model.mutes_len] = m;
+    model.mutes_len += 1;
+}
+
+// ---------------------------------------------------------------- walking
+
+const WalkCtx = struct { model: *Model, fx: *Effects };
+
+fn walkCtx(p: *anyopaque) *WalkCtx {
+    return @ptrCast(@alignCast(p));
+}
+
+fn walkPosition(p: *anyopaque) ?f64 {
+    const c = walkCtx(p);
+    const r = c.fx.moveWindow("main", 0, 0, false) orelse return null;
+    return r.x;
+}
+
+fn walkMove(p: *anyopaque, x: f64) ?motion.Landed {
+    const c = walkCtx(p);
+    const cur = c.fx.moveWindow("main", 0, 0, false) orelse return null;
+    // clamp: the host keeps the window inside the work area and says so.
+    const r = c.fx.moveWindow("main", x - cur.x, 0, true) orelse return null;
+    c.model.pet_x = r.x;
+    c.model.pet_y = r.y;
+    c.model.have_position = true;
+    return .{ .x = r.x, .hit = r.hit_x };
+}
+
+fn walkSave(p: *anyopaque, window_x: f64) void {
+    const c = walkCtx(p);
+    // y from the window (walks are horizontal); x as the walker sent it.
+    readPosition(c.model, c.fx);
+    if (!c.model.have_position) return;
+    c.model.pet_x = window_x;
+    const x = window_x + firstOffset(c.model);
+    if (c.model.connected and c.model.driven) {
+        send(protocol.Position{ .x = x, .y = c.model.pet_y, .secondSide = .left, .walk = true });
+    } else core.savePosition(args.user_data, x, c.model.pet_y);
+}
+
+fn walkArm(p: *anyopaque, ms: u32) void {
+    walkCtx(p).fx.startTimer(.{ .key = walk_timer_key, .interval_ms = ms, .mode = .one_shot, .on_fire = Effects.timerMsg(.walk_tick) });
+}
+
+fn walkDisarm(p: *anyopaque) void {
+    walkCtx(p).fx.cancelTimer(walk_timer_key);
+}
+
+const WalkOp = union(enum) { tick, interrupt, stop, set: ?protocol.Motion };
+
+/// One walker call; the pose it leaves (running or not) goes on screen.
+fn walk(model: *Model, fx: *Effects, op: WalkOp) void {
+    const before = model.walker.pose();
+    var ctx: WalkCtx = .{ .model = model, .fx = fx };
+    const env: motion.Env = .{
+        .ctx = &ctx,
+        .now_ms = fx.wallMs(),
+        .random = model.rng.random(),
+        .scale = model.size.scale(),
+        .position = walkPosition,
+        .move_to = walkMove,
+        .save = walkSave,
+        .arm = walkArm,
+        .disarm = walkDisarm,
+    };
+    switch (op) {
+        .tick => model.walker.tick(env),
+        .interrupt => model.walker.interrupt(env),
+        .stop => model.walker.stop(env),
+        .set => |m| {
+            if (m == .dash and model.walker.mode != .dash) model.dash_spent = true;
+            model.walker.setMotion(env, m);
+        },
+    }
+    if (!std.meta.eql(before, model.walker.pose())) applyTracks(model, fx);
+}
+
+/// The driver's motion minus what the pet sees itself: hidden, dragged,
+/// hovered, panel open, reduce motion, asleep, just touched; offline also
+/// quiet, a local reaction or bubble (the timeline's own gates are
+/// compiled in). A dash runs once per moment.
+fn effectiveMotion(model: *const Model, now: i64) ?protocol.Motion {
+    const want = model.motion_want orelse return null;
+    if (!onScreen(model) or !model.first.ok or model.dragging or model.reduce_motion or model.sleeping) return null;
+    if (want == .dash) return if (model.dash_spent and model.walker.mode != .dash) null else .dash;
+    if (model.hover_inside or model.panel_open or now < model.roam_block_until_ms) return null;
+    if (!model.driven) {
+        if (now < model.quiet_until_ms or model.local_state != null or model.bubble_len > 0) return null;
+    }
+    return .roam;
+}
+
+/// The driver's motion; leaving 'dash' ends the dash episode.
+fn setMotionWant(model: *Model, m: ?protocol.Motion) void {
+    model.motion_want = m;
+    if (m != .dash) model.dash_spent = false;
+}
+
+fn updateMotion(model: *Model, fx: *Effects) void {
+    walk(model, fx, .{ .set = effectiveMotion(model, fx.wallMs()) });
+}
+
+/// A hover, click or drag: stop walking now and roam no sooner than
+/// `roam_after_interaction_ms`; offline it also wakes a sleeping pet.
+fn touched(model: *Model, fx: *Effects) void {
+    const now = fx.wallMs();
+    model.roam_block_until_ms = now + roam_after_interaction_ms;
+    if (!model.driven) model.awake_until_ms = now + awake_after_interaction_ms;
+    walk(model, fx, .interrupt);
+    updateMotion(model, fx);
+}
+
+// ------------------------------------------------------------- panel
+
+/// Live: Electron's panel (it decides open / closed).
+fn setLivePanel(model: *Model, panel: ?protocol.Panel, now: i64) void {
+    const p = panel orelse {
+        model.panel_open = false;
+        model.panel_dismissed = false;
+        return;
+    };
+    if (model.panel_dismissed) return;
+    if (!model.panel_open) model.panel_deadline_ms = now + panel_idle_ms;
+    model.panel_open = true;
+    model.panel_lines_len = 0;
+    for (p.lines) |line| addPanelLine(model, line);
+    model.panel_actions_len = 0;
+    for (p.actions) |a| addPanelAction(model, a.id, a.label, "");
+}
+
+fn addPanelLine(model: *Model, line: []const u8) void {
+    if (model.panel_lines_len >= model.panel_lines.len) return;
+    var b: Buf(protocol.max_panel_line_bytes) = .{};
+    _ = b.set(line);
+    model.panel_lines[model.panel_lines_len] = b;
+    model.panel_lines_len += 1;
+}
+
+fn addPanelAction(model: *Model, id: []const u8, label: []const u8, target: []const u8) void {
+    if (model.panel_actions_len >= model.panel_actions.len) return;
+    var slot: ActionSlot = .{};
+    _ = slot.id.set(id);
+    _ = slot.label.set(label);
+    _ = slot.target.set(target);
+    model.panel_actions[model.panel_actions_len] = slot;
+    model.panel_actions_len += 1;
+}
+
+/// Offline: the timeline's static panel at `now` (countdown line on top,
+/// buttons inside their windows). False when it has nothing to show.
+fn fillOfflinePanel(model: *Model, now: i64) bool {
+    model.panel_lines_len = 0;
+    model.panel_actions_len = 0;
+    const tl = &(model.timeline orelse return false);
+    const panel = tl.panel() orelse return false;
+    var buf: [256]u8 = undefined;
+    if (tl.panelCountdown(&buf, now)) |line| addPanelLine(model, line);
+    for (panel.lines) |line| addPanelLine(model, line);
+    for (panel.actions) |a| {
+        if (a.shownAt(now)) addPanelAction(model, a.id, a.label, a.target orelse "");
+    }
+    return model.panel_lines_len > 0 or model.panel_actions_len > 0;
+}
+
+/// The pet closes the panel itself (20 s, Escape): live, Electron hears
+/// `panelAction close` (L4's PANEL_CLOSE_ID) and the panel stays shut
+/// until a render drops it.
+fn closePanelHere(model: *Model) void {
+    if (!model.panel_open) return;
+    if (model.connected and model.driven) {
+        model.panel_open = false;
+        model.panel_dismissed = true;
+        send(protocol.Event{ .event = .panelAction, .id = protocol.panel_close_id });
+    } else closeOfflinePanel(model);
+}
+
+/// Offline: the entry's bubble (held back while the panel was open, as
+/// the controller holds once-only moments) is applied again.
+fn closeOfflinePanel(model: *Model) void {
+    if (!model.panel_open) return;
+    model.panel_open = false;
+    model.timeline_entry = null;
+}
+
+fn toggleOfflinePanel(model: *Model, now: i64) void {
+    if (model.panel_open) return closeOfflinePanel(model);
+    if (!fillOfflinePanel(model, now)) return;
+    model.panel_open = true;
+    model.panel_deadline_ms = now + panel_idle_ms;
 }
 
 // ------------------------------------------------------------ messages
@@ -536,16 +1063,20 @@ fn handleLine(model: *Model, line: []const u8, fx: *Effects) void {
             model.size = s.size;
             model.duo = s.duo;
             if (s.position) |p| model.pending_move = p;
+            walk(model, fx, .stop);
+            model.walker.forgetEdges();
             syncFrames(model, fx);
             fitWindow(model, fx);
-            armFrameTimer(model, fx);
+            armFrameTimers(model, fx);
             placeWindow(model, fx);
         },
         .hide => {
             model.driven = true;
             model.visible = false;
             setBubble(model, null, null, 0);
-            fx.cancelTimer(frame_timer_key);
+            model.panel_open = false;
+            walk(model, fx, .stop);
+            cancelFrameTimers(model, fx);
             fitWindow(model, fx);
         },
         .render => |r| {
@@ -559,16 +1090,15 @@ fn handleLine(model: *Model, line: []const u8, fx: *Effects) void {
                 model.want_second_rows = second.rows;
             }
             setBubble(model, r.bubble, null, 0);
+            setBubbleActions(model, r.bubble_actions, null);
+            setBadge(model, r.badge);
+            setLivePanel(model, r.panel, fx.wallMs());
+            model.sleeping = r.sleeping;
+            setMotionWant(model, r.motion);
+            setWant(model, r.anim(), r.second_anim);
             defer placeWindow(model, fx);
-            applyShow(model, .{
-                .state = r.state,
-                .row = r.row,
-                .frames = r.frames,
-                .duration_ms = r.duration_ms,
-                .once = r.once,
-                .still = r.still,
-                .play_key = r.play_key,
-            }, fx);
+            refreshAnim(model, fx);
+            updateMotion(model, fx);
         },
         .menu => |m| {
             model.driven = true;
@@ -582,8 +1112,11 @@ fn handleLine(model: *Model, line: []const u8, fx: *Effects) void {
                 model.timeline_entry = null;
                 applyTimelineSprites(model);
                 // Electron merged our native state before compiling, so
-                // its quiet wins (a quiet ended in the app must end).
+                // its quiet wins (a quiet ended in the app must end), and
+                // its settings carry our mutes now.
                 model.quiet_until_ms = tl.quiet_until_ms;
+                model.mutes_len = 0;
+                model.dismissed.len = 0;
                 core.noteHandoff();
                 send(protocol.Ack{});
             } else |_| {
@@ -654,35 +1187,79 @@ fn defaultMenus(model: *Model) void {
 // ------------------------------------------------------------ interaction
 
 fn onClick(model: *Model, fx: *Effects) void {
+    touched(model, fx);
     if (model.connected and model.driven) return send(protocol.Event{ .event = .click });
+    // Offline: jump, and the panel opens / closes (SPEC 3a).
+    toggleOfflinePanel(model, fx.wallMs());
     react(model, .jumping, fx);
 }
 
-fn onDoubleClick(model: *Model) void {
+fn onDoubleClick(model: *Model, fx: *Effects) void {
+    touched(model, fx);
     if (model.connected and model.driven) return send(protocol.Event{ .event = .dblclick });
     core.openApp(appLaunch(), "/");
 }
 
 fn onHover(model: *Model, fx: *Effects) void {
+    touched(model, fx);
     if (model.connected and model.driven) return send(protocol.Event{ .event = .hover });
     const now = fx.wallMs();
     if (now < model.quiet_until_ms) return;
-    var buf: [256]u8 = undefined;
-    const text: ?[]const u8 = if (model.timeline) |*tl|
-        (if (showsDuo(model)) tl.duo_text else null) orelse core.hoverText(&buf, tl, now)
-    else
-        null;
-    if (text) |t| setBubble(model, t, if (model.timeline) |*tl| tl.calendar_target else "/", now + hover_bubble_ms);
+    // The panel stays in front of a hover line.
+    if (!model.panel_open) {
+        var buf: [256]u8 = undefined;
+        const text: ?[]const u8 = if (model.timeline) |*tl|
+            (if (showsDuo(model)) tl.duo_text else null) orelse core.hoverText(&buf, tl, now)
+        else
+            null;
+        if (text) |t| setBubble(model, t, if (model.timeline) |*tl| tl.calendar_target else "/", now + hover_bubble_ms);
+    }
     react(model, .waving, fx);
 }
 
-fn onBubbleClick(model: *Model) void {
+fn onBubbleClick(model: *Model, fx: *Effects) void {
+    touched(model, fx);
     if (model.connected and model.driven) return send(protocol.Event{ .event = .bubbleClick });
     const target = model.bubble_target.slice();
     if (protocol.appPathOk(target)) core.openApp(appLaunch(), target);
 }
 
-fn react(model: *Model, state: State, fx: *Effects) void {
+/// A button under the bubble. Live it only reports; offline: ok dismisses,
+/// quiet-* quiets like the tray, mute silences the bubble's kind for the
+/// rest of the timeline and records it for Electron.
+fn onBubbleAction(model: *Model, index: u8, fx: *Effects) void {
+    if (index >= model.bubble_actions_len) return;
+    const id = model.bubble_actions[index].id.slice();
+    if (model.connected and model.driven) return send(protocol.Event{ .event = .bubbleAction, .id = id });
+    if (std.mem.eql(u8, id, "quiet-1h")) return setQuiet(model, .@"1h", fx);
+    if (std.mem.eql(u8, id, "quiet-session")) return setQuiet(model, .session, fx);
+    if (std.mem.eql(u8, id, "mute")) {
+        const kind = model.bubble_kind.slice();
+        if (kind.len > 0) {
+            addMute(model, kind);
+            core.saveMute(args.user_data, kind);
+            if (std.mem.eql(u8, kind, "calendar")) if (model.timeline) |*tl| tl.muteSessionReactions();
+        }
+    } else if (!std.mem.eql(u8, id, "ok")) return;
+    _ = model.dismissed.set(model.bubble[0..model.bubble_len]);
+    setBubble(model, null, null, 0);
+    updateMotion(model, fx);
+}
+
+/// A panel button. Live it only reports; offline it opens its target.
+fn onPanelAction(model: *Model, index: u8, fx: *Effects) void {
+    if (index >= model.panel_actions_len) return;
+    const slot = &model.panel_actions[index];
+    if (model.connected and model.driven) return send(protocol.Event{ .event = .panelAction, .id = slot.id.slice() });
+    // Copy the path out first: closing may refill the panel's slots.
+    var target: Buf(512) = .{};
+    _ = target.set(slot.target.slice());
+    closeOfflinePanel(model);
+    if (protocol.appPathOk(target.slice())) core.openApp(appLaunch(), target.slice());
+    showUndriven(model, fx);
+}
+
+fn react(model: *Model, state: sprite.State, fx: *Effects) void {
     model.local_state = state;
     model.local_until_ms = fx.wallMs() + react_ms;
     showUndriven(model, fx);
@@ -691,6 +1268,7 @@ fn react(model: *Model, state: State, fx: *Effects) void {
 fn dragStarted(model: *Model, dir: i8, fx: *Effects) void {
     model.dragging = true;
     model.drag_dir = dir;
+    touched(model, fx);
     fx.startTimer(.{ .key = drag_watchdog_key, .interval_ms = drag_watchdog_ms, .mode = .one_shot, .on_fire = Effects.timerMsg(.drag_watchdog) });
     if (model.connected and model.driven) {
         if (dir != 0) send(protocol.Event{ .event = .drag, .dx = @floatFromInt(@as(i32, dir) * 12), .dy = 0 });
@@ -712,16 +1290,33 @@ fn readPosition(model: *Model, fx: *Effects) void {
 fn dragEnded(model: *Model, fx: *Effects) void {
     if (!model.dragging) return;
     model.dragging = false;
+    // Maybe another display now: the walk's edges are unknown again.
+    model.walker.forgetEdges();
     fx.cancelTimer(drag_watchdog_key);
     if (is_linux) readPosition(model, fx);
     if (model.connected and model.driven) {
         // position goes BEFORE dragEnd (native-protocol.mjs).
         if (model.have_position) send(protocol.Position{ .x = model.pet_x + firstOffset(model), .y = model.pet_y, .secondSide = .left });
         send(protocol.Event{ .event = .dragEnd });
+        updateMotion(model, fx);
         return;
     }
     if (model.have_position) core.savePosition(args.user_data, model.pet_x + firstOffset(model), model.pet_y);
     model.local_state = null;
+    showUndriven(model, fx);
+}
+
+/// Quiet from the menus or a bubble button while no Electron is connected.
+fn setQuiet(model: *Model, kind: protocol.QuietKind, fx: *Effects) void {
+    const now = fx.wallMs();
+    model.quiet_until_ms = switch (kind) {
+        .off => 0,
+        .@"1h" => now + 60 * 60 * 1000,
+        .session => if (model.timeline) |*tl| tl.sessionEndAfter(now) orelse now else now,
+    };
+    core.saveQuiet(args.user_data, if (model.quiet_until_ms > now) model.quiet_until_ms else null);
+    setBubble(model, null, null, 0);
+    model.timeline_entry = null;
     showUndriven(model, fx);
 }
 
@@ -742,28 +1337,22 @@ fn pick(model: *Model, menu: *Menu, index: u8, fx: *Effects) void {
         .open => |p| core.openApp(appLaunch(), p.slice()),
         .install_update => core.installUpdate(appLaunch()),
         .quit => quitPet(),
-        .quiet => |kind| {
-            const now = fx.wallMs();
-            model.quiet_until_ms = switch (kind) {
-                .off => 0,
-                .@"1h" => now + 60 * 60 * 1000,
-                .session => if (model.timeline) |*tl| tl.sessionEndAfter(now) orelse now else now,
-            };
-            core.saveQuiet(args.user_data, if (model.quiet_until_ms > now) model.quiet_until_ms else null);
-            setBubble(model, null, null, 0);
-            model.timeline_entry = null;
-            showUndriven(model, fx);
-        },
+        .quiet => |kind| setQuiet(model, kind, fx),
         .toggle_pet => {
             model.visible = !model.visible;
             core.saveEnabled(args.user_data, model.visible);
-            if (model.visible) showUndriven(model, fx) else fx.cancelTimer(frame_timer_key);
+            if (model.visible) showUndriven(model, fx) else {
+                cancelFrameTimers(model, fx);
+                model.panel_open = false;
+                walk(model, fx, .stop);
+            }
             fitWindow(model, fx);
         },
         .size => |s| {
             model.size = s;
             core.saveSize(args.user_data, s);
             fitWindow(model, fx);
+            refreshAnim(model, fx);
         },
         .launch_at_login => {
             // The current value lives in Electron's menu item.
@@ -803,6 +1392,7 @@ fn quitPet() void {
 
 pub fn boot(model: *Model, fx: *Effects) void {
     model.size = args.size;
+    model.rng = .init(@bitCast(fx.wallMs()));
     defaultMenus(model);
     if (args.pet_dir) |dir| {
         var buf: [protocol.max_path_bytes]u8 = undefined;
@@ -826,6 +1416,9 @@ pub fn boot(model: *Model, fx: *Effects) void {
         if (st.enabled) |e| model.visible = e;
         if (st.size) |s| model.size = s;
         if (st.quiet_until_ms) |q| model.quiet_until_ms = q;
+        // Muted offline before a restart of the pet: still muted.
+        for (st.mutes[0..st.mutes_len]) |*m| addMute(model, m.kind());
+        if (model.timeline) |*tl| if (isMuted(model, "calendar")) tl.muteSessionReactions();
     }
     setPollRate(model, fx);
     showUndriven(model, fx);
@@ -837,9 +1430,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .frame_tick => |timer| {
             if (timer.outcome != .fired) return;
-            if (model.once and model.frame_index + 1 >= model.frames) return;
-            model.frame_index = (model.frame_index + 1) % model.frames;
+            model.timer1_on = false;
+            if (!model.anim.advance()) return;
             armFrameTimer(model, fx);
+        },
+        .frame2_tick => |timer| {
+            if (timer.outcome != .fired) return;
+            model.timer2_on = false;
+            if (model.anim2.delay_pending) {
+                model.anim2.delay_pending = false;
+            } else if (!model.anim2.advance()) return;
+            armFrame2Timer(model, fx);
+        },
+        .walk_tick => |timer| {
+            if (timer.outcome != .fired) return;
+            walk(model, fx, .tick);
         },
         .poll_tick => |timer| {
             if (timer.outcome != .fired) return;
@@ -857,13 +1462,27 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .native_drag_started => |dir| dragStarted(model, dir, fx),
         .native_drag_ended => dragEnded(model, fx),
         .pointer_click => onClick(model, fx),
-        .pointer_dblclick => onDoubleClick(model),
+        .pointer_dblclick => onDoubleClick(model, fx),
         .pointer_enter => {
-            if (!model.hover_inside and !model.dragging) onHover(model, fx);
+            const now = fx.wallMs();
+            // Back from the bubble / panel (or a flicker): the same hover.
+            const fresh = now - model.pointer_left_ms > hover_regrace_ms;
+            if (!model.hover_inside and !model.dragging and fresh) onHover(model, fx);
             model.hover_inside = true;
+            updateMotion(model, fx);
         },
-        .pointer_leave => model.hover_inside = false,
-        .bubble_click => onBubbleClick(model),
+        .pointer_leave => {
+            model.hover_inside = false;
+            model.pointer_left_ms = fx.wallMs();
+        },
+        .bubble_click => onBubbleClick(model, fx),
+        .bubble_action => |i| onBubbleAction(model, i, fx),
+        .panel_action => |i| onPanelAction(model, i, fx),
+        .escape => if (model.panel_open) {
+            closePanelHere(model);
+            showUndriven(model, fx);
+            updateMotion(model, fx);
+        },
         .tray_pick => |i| pick(model, &model.tray, i, fx),
         .pet_pick => |i| pick(model, &model.pet_menu, i, fx),
         .noop => {},
@@ -899,11 +1518,21 @@ fn poll(model: *Model, fx: *Effects) void {
             model.connected = false;
             model.driven = false;
             model.timeline_entry = null;
+            // Electron's badge and panel die with it.
+            model.badge = false;
+            model.panel_open = false;
+            model.panel_dismissed = false;
             showUndriven(model, fx);
         }
     }
-    if (model.bubble_until_ms != 0 and now >= model.bubble_until_ms) setBubble(model, null, null, 0);
+    if (model.bubble_until_ms != 0 and now >= model.bubble_until_ms) {
+        setBubble(model, null, null, 0);
+        // A hover line covered the entry's bubble: bring it back.
+        if (!model.driven) model.timeline_entry = null;
+    }
+    pollPanel(model, now);
     placeBubble(model, fx);
+    defer updateMotion(model, fx);
     if (model.driven) return;
     // Re-evaluate only when something changed: a local reaction ended or
     // the timeline moved to its next entry. Re-applying every tick cost
@@ -917,12 +1546,27 @@ fn poll(model: *Model, fx: *Effects) void {
     if (model.timeline) |*tl| {
         const index: ?usize = if (tl.entryAt(now)) |hit| hit.index else null;
         if (index != model.timeline_entry) changed = true;
+        // A sleeping entry falls asleep again once the wake-up ran out.
+        if (tl.entryAt(now)) |hit| if (hit.entry.sleeping and hit.entry.visible) {
+            if ((now >= model.awake_until_ms) != model.sleeping) changed = true;
+        };
     }
     if (changed) showUndriven(model, fx);
     if (model.timeline) |*tl| {
         // launch.zig keeps one run at a time and backs off on failure.
         if (tl.refresh_at_ms > 0 and now >= tl.refresh_at_ms) core.refreshApp(appLaunch());
     }
+}
+
+/// The panel's 20 s rule (and, offline, its countdown line).
+fn pollPanel(model: *Model, now: i64) void {
+    if (!model.panel_open) return;
+    if (model.hover_inside or model.pointer_in_float) {
+        model.panel_deadline_ms = now + panel_idle_ms;
+    } else if (now >= model.panel_deadline_ms) {
+        return closePanelHere(model);
+    }
+    if (!model.driven and !fillOfflinePanel(model, now)) closeOfflinePanel(model);
 }
 
 /// Win/mac only (Linux reports pointer and drag through commands): the
@@ -932,7 +1576,7 @@ fn frameClock(model: *Model, fx: *Effects) void {
     model.pet_x = read.x;
     model.pet_y = read.y;
     model.have_position = true;
-    // The bubble follows the pet (also while it is dragged).
+    // The bubble follows the pet (also while it is dragged or walks).
     defer placeBubbleAt(model, fx, model.pet_x, model.pet_y);
     const now = fx.wallMs();
     if (model.dragging) {
@@ -955,7 +1599,7 @@ fn frameClock(model: *Model, fx: *Effects) void {
             fx.cancelTimer(drag_watchdog_key);
             if (now - model.last_click_ms <= double_click_ms) {
                 model.last_click_ms = 0;
-                onDoubleClick(model);
+                onDoubleClick(model, fx);
             } else {
                 model.last_click_ms = now;
                 onClick(model, fx);
@@ -967,7 +1611,18 @@ fn frameClock(model: *Model, fx: *Effects) void {
     const inside = read.cursor_x >= read.x and read.cursor_x <= read.x + windowW(model) and
         read.cursor_y >= read.y and read.cursor_y <= read.y + windowH(model);
     if (inside and !model.hover_inside) onHover(model, fx);
-    model.hover_inside = inside;
+    if (inside != model.hover_inside) {
+        model.hover_inside = inside;
+        updateMotion(model, fx);
+    }
+    // The panel counts as "pointer inside" too (its 20 s rule).
+    model.pointer_in_float = false;
+    const shown = floatShown(model);
+    if (shown == .panel) if (fx.moveWindow(shown.label(), 0, 0, false)) |f| {
+        const size = floatSize(model, shown);
+        model.pointer_in_float = read.cursor_x >= f.x and read.cursor_x <= f.x + size.w and
+            read.cursor_y >= f.y and read.cursor_y <= f.y + size.h;
+    };
     if (read.primary_down and !model.primary_was_down and inside) {
         model.dragging = true;
         model.drag_dir = 0;
@@ -1008,6 +1663,12 @@ fn onAppearance(appearance: native_sdk.platform.Appearance) ?Msg {
     return .{ .appearance = appearance };
 }
 
+/// Escape closes the panel (when a key reaches the pet at all).
+fn onKey(keyboard: canvas.WidgetKeyboardEvent) ?Msg {
+    if (keyboard.phase == .key_down and std.mem.eql(u8, keyboard.key, "escape")) return .escape;
+    return null;
+}
+
 // ------------------------------------------------------------------ view
 
 fn tokens(model: *const Model) canvas.DesignTokens {
@@ -1034,11 +1695,11 @@ fn petMenu(model: *const Model) []const AppUi.ContextMenuItem {
     return pet_menu_scratch[0..model.pet_menu.len];
 }
 
-fn spriteNode(ui: *AppUi, model: *const Model, base: u64, label: []const u8) AppUi.Node {
+fn spriteNode(ui: *AppUi, model: *const Model, base: u64, frame_index: usize, label: []const u8) AppUi.Node {
     var node = ui.image(.{
         .width = spriteW(model),
         .height = spriteH(model),
-        .image = base + model.frame_index,
+        .image = base + frame_index,
         .semantics = .{ .label = label },
     });
     node.widget.image_fit = .stretch;
@@ -1046,19 +1707,68 @@ fn spriteNode(ui: *AppUi, model: *const Model, base: u64, label: []const u8) App
     return node;
 }
 
+/// Answer-ready dot (pet.css #badge: 14 px, #e10600, white ring).
+const badge_d: f32 = 14;
+
+/// The sprites plus, on top, the sleeping "z z" by the first pet's head
+/// (pet.js applySleep: 0.64 w in, 0.08 h down) and the answer-ready dot at
+/// its upper right (pet.js: 10 % of w in from the right, BADGE_TOP 0.25 h
+/// down, clear of the "z z").
+fn withMarks(ui: *AppUi, model: *const Model, sprites: AppUi.Node) AppUi.Node {
+    if (!model.sleeping and !model.badge) return sprites;
+    const sw = spriteW(model);
+    const h = spriteH(model);
+    const left = firstOffset(model);
+    var nodes: [3]AppUi.Node = undefined;
+    var n: usize = 0;
+    nodes[n] = sprites;
+    n += 1;
+    if (model.sleeping) {
+        // pet.js sizes it max(10, 0.1 h) px: s / m / l → small / body / large.
+        var z = ui.text(.{
+            .size = switch (model.size) {
+                .s => .sm,
+                .m => .default,
+                .l => .lg,
+            },
+            .frame = geometry.RectF.init(@round(left + sw * 0.64), @round(h * 0.08), @round(sw * 0.34), @round(@max(14, h * 0.16))),
+            .semantics = .{ .label = "Asleep" },
+        }, "z z");
+        z.widget.style.foreground = if (model.dark) canvas.Color.rgb8(196, 206, 230) else canvas.Color.rgb8(92, 104, 140);
+        nodes[n] = z;
+        n += 1;
+    }
+    if (model.badge) {
+        var dot = ui.el(.panel, .{
+            .frame = geometry.RectF.init(@round(left + sw - sw * 0.1 - badge_d), @round(h * 0.25), badge_d, badge_d),
+            .padding = 0,
+            .semantics = .{ .label = model.badge_label.slice() },
+        }, .{});
+        dot.widget.style.background = canvas.Color.rgb8(225, 6, 0);
+        dot.widget.style.border = canvas.Color.rgb8(255, 255, 255);
+        dot.widget.style.stroke_width = 2;
+        dot.widget.style.radius = badge_d / 2;
+        nodes[n] = dot;
+        n += 1;
+    }
+    return ui.stack(.{ .width = windowW(model), .height = h }, nodes[0..n]);
+}
+
 pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
     const menu = petMenu(model);
     if (!onScreen(model) or !model.first.ok) {
         return ui.el(.stack, .{ .grow = 1, .context_menu = menu }, .{});
     }
-    var first = spriteNode(ui, model, first_image_base, "TracingInsights pet");
+    var first = spriteNode(ui, model, first_image_base, model.anim.frame_index, "TracingInsights pet");
     first.context_menu = menu;
-    const body = if (showsDuo(model)) blk: {
-        var second = spriteNode(ui, model, second_image_base, "Second pet");
+    const sprites = if (showsDuo(model)) blk: {
+        const index = if (model.second_mirrors) model.anim.frame_index else model.anim2.frame_index;
+        var second = spriteNode(ui, model, second_image_base, index, "Second pet");
         second.context_menu = menu;
         // The second pet stands on the left (pet-window.mjs duoSecondSide).
         break :blk ui.row(.{ .gap = duoGap(model), .cross = .end }, .{ second, first });
     } else first;
+    const body = withMarks(ui, model, sprites);
     if (is_linux) {
         // GTK hands primary presses to the compositor (window drag); the
         // ti-pet SDK patch reports clicks, double-clicks and hover back.
@@ -1070,41 +1780,137 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
     return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = menu }, .{body});
 }
 
-// ---------------------------------------------------------------- bubble
+// ------------------------------------------------- bubble and panel
 
 const bubble_w: f32 = 260;
 const bubble_h: f32 = 64;
+/// A bubble with buttons and the panel grow up to this wide (pet-window.mjs
+/// bubbleArea: 240–440 px), then wrap their buttons.
+const float_max_w: f32 = 440;
+const panel_min_w: f32 = 300;
+const panel_line_h: f32 = 20;
+const button_row_h: f32 = 34;
+const button_gap: f32 = 6;
+const card_pad: f32 = 10;
 const bubble_gap: f32 = 6;
+const max_float_buttons = @max(protocol.max_bubble_actions, protocol.max_panel_actions);
 
-/// Win/mac: the bubble's top-left for a pet window at (pet_x, pet_y),
-/// centred over the sprite group (it spans the whole window) and above it.
-fn bubbleX(model: *const Model, pet_x: f64) f64 {
-    return pet_x + windowW(model) / 2 - bubble_w / 2;
+/// A small button's width, estimated like pet-window.mjs (~8 px a
+/// character + 16 px padding).
+fn buttonW(label: []const u8) f32 {
+    const chars = std.unicode.utf8CountCodepoints(label) catch label.len;
+    return @as(f32, @floatFromInt(chars)) * 8 + 16;
 }
 
-fn bubbleY(pet_y: f64) f64 {
-    return pet_y - bubble_h - bubble_gap;
+/// A text line's width (~7 px a character at the bubble's size).
+fn lineW(text: []const u8) f32 {
+    const chars = std.unicode.utf8CountCodepoints(text) catch text.len;
+    return @as(f32, @floatFromInt(chars)) * 7;
 }
 
-/// Win/mac: keep the bubble window centred above the pet. The SDK applies
-/// a secondary window's x/y only when it creates it (AppKit even centres
-/// it on screen), so the bubble is moved by the difference between where
+/// Buttons laid out greedily in rows `inner` wide: the row of each button
+/// in `row_of`; returns the number of rows.
+fn wrapButtons(slots: []const ActionSlot, inner: f32, row_of: []u8) usize {
+    var rows: usize = 0;
+    var used: f32 = 0;
+    for (slots, 0..) |*slot, i| {
+        const w = buttonW(slot.label.slice());
+        if (rows == 0 or (used > 0 and used + button_gap + w > inner)) {
+            rows += 1;
+            used = w;
+        } else used += button_gap + w;
+        row_of[i] = @intCast(rows - 1);
+    }
+    return rows;
+}
+
+fn rowWidth(slots: []const ActionSlot) f32 {
+    var w: f32 = 0;
+    for (slots, 0..) |*slot, i| w += buttonW(slot.label.slice()) + (if (i > 0) button_gap else 0);
+    return w;
+}
+
+fn floatShown(model: *const Model) Float {
+    if (!onScreen(model) or !model.first.ok) return .none;
+    if (model.panel_open and (model.panel_lines_len > 0 or model.panel_actions_len > 0)) return .panel;
+    if (model.bubble_len == 0) return .none;
+    return if (model.bubble_actions_len > 0) .bubble_actions else .bubble;
+}
+
+const FloatSize = struct { w: f32, h: f32, rows: usize = 0 };
+
+fn floatSize(model: *const Model, f: Float) FloatSize {
+    var row_of: [max_float_buttons]u8 = undefined;
+    return switch (f) {
+        .none, .bubble => .{ .w = bubble_w, .h = bubble_h },
+        .bubble_actions => blk: {
+            const slots = model.bubble_actions[0..model.bubble_actions_len];
+            const w = std.math.clamp(rowWidth(slots) + 2 * card_pad + 4, bubble_w, float_max_w);
+            const rows = wrapButtons(slots, w - 2 * card_pad - 4, &row_of);
+            break :blk .{ .w = w, .h = 68 + @as(f32, @floatFromInt(rows)) * button_row_h, .rows = rows };
+        },
+        .panel => blk: {
+            const slots = model.panel_actions[0..model.panel_actions_len];
+            var widest = rowWidth(slots);
+            for (model.panel_lines[0..model.panel_lines_len]) |*line| widest = @max(widest, lineW(line.slice()));
+            const w = std.math.clamp(widest + 2 * card_pad + 4, panel_min_w, float_max_w);
+            const rows = wrapButtons(slots, w - 2 * card_pad - 4, &row_of);
+            const lines: f32 = @floatFromInt(model.panel_lines_len);
+            const gap: f32 = if (rows > 0 and model.panel_lines_len > 0) 6 else 0;
+            break :blk .{ .w = w, .h = 26 + lines * panel_line_h + gap + @as(f32, @floatFromInt(rows)) * button_row_h, .rows = rows };
+        },
+    };
+}
+
+/// Win/mac: the floating window's top-left for a pet window at (pet_x,
+/// pet_y), centred over the sprite group (it spans the whole window) and
+/// above it, or below when it would leave the top of the screen.
+fn floatX(model: *const Model, pet_x: f64, size: FloatSize) f64 {
+    return pet_x + windowW(model) / 2 - size.w / 2;
+}
+
+fn floatY(model: *const Model, pet_y: f64, size: FloatSize) f64 {
+    const above = pet_y - size.h - bubble_gap;
+    return if (above >= 0) above else pet_y + windowH(model) + bubble_gap;
+}
+
+/// Win/mac: keep the floating window centred above the pet. The SDK
+/// applies a secondary window's x/y only when it creates it (AppKit even
+/// centres it on screen), so it is moved by the difference between where
 /// it is and where it belongs. Both rects come from moveWindow, which
 /// every host reports in one space (top-left origin, points / DIPs).
 /// (pet_x, pet_y) is the main window's fresh origin. Linux uses a
-/// GtkPopover anchored to the pet instead.
-fn placeBubbleAt(model: *const Model, fx: *Effects, pet_x: f64, pet_y: f64) void {
-    if (is_linux or !bubbleShown(model)) return;
+/// GtkPopover anchored to the pet instead (GTK flips it below itself).
+fn placeBubbleAt(model: *Model, fx: *Effects, pet_x: f64, pet_y: f64) void {
+    if (is_linux) return;
+    const shown = floatShown(model);
+    if (shown != model.float_shown) {
+        // A new window: created at its declared size.
+        model.float_shown = shown;
+        const declared = floatSize(model, shown);
+        model.float_w_applied = declared.w;
+        model.float_h_applied = declared.h;
+    }
+    if (shown == .none) return;
+    const size = floatSize(model, shown);
+    // New text or buttons change the size (secondary windows are not
+    // resized from their declaration once created).
+    if ((size.w != model.float_w_applied or size.h != model.float_h_applied) and
+        fx.resizeWindow(shown.label(), size.w, size.h, .top_left))
+    {
+        model.float_w_applied = size.w;
+        model.float_h_applied = size.h;
+    }
     // Null until the runtime created the declared window (after update).
-    const cur = fx.moveWindow("bubble", 0, 0, false) orelse return;
-    const dx = bubbleX(model, pet_x) - cur.x;
-    const dy = bubbleY(pet_y) - cur.y;
+    const cur = fx.moveWindow(shown.label(), 0, 0, false) orelse return;
+    const dx = floatX(model, pet_x, size) - cur.x;
+    const dy = floatY(model, pet_y, size) - cur.y;
     if (@abs(dx) < 0.5 and @abs(dy) < 0.5) return;
-    _ = fx.moveWindow("bubble", dx, dy, false);
+    _ = fx.moveWindow(shown.label(), dx, dy, false);
 }
 
 fn placeBubble(model: *Model, fx: *Effects) void {
-    if (is_linux or !bubbleShown(model)) return;
+    if (is_linux or floatShown(model) == .none) return;
     const pet = fx.moveWindow("main", 0, 0, false) orelse return;
     model.pet_x = pet.x;
     model.pet_y = pet.y;
@@ -1112,20 +1918,18 @@ fn placeBubble(model: *Model, fx: *Effects) void {
     placeBubbleAt(model, fx, pet.x, pet.y);
 }
 
-fn bubbleShown(model: *const Model) bool {
-    return onScreen(model) and model.first.ok and model.bubble_len > 0;
-}
-
 fn petWindows(model: *const Model, scratch: *PetApp.WindowsScratch) []const PetApp.WindowDescriptor {
-    if (!bubbleShown(model)) return scratch.windows[0..0];
+    const shown = floatShown(model);
+    if (shown == .none) return scratch.windows[0..0];
+    const size = floatSize(model, shown);
     if (is_linux) {
         // A GtkPopover anchored above the sprite (upstream's Linux path):
         // GTK_POS_TOP places the popup above the pointing rectangle.
         scratch.windows[0] = .{
-            .label = "bubble",
+            .label = shown.label(),
             .canvas_label = "bubble-canvas",
-            .width = bubble_w,
-            .height = bubble_h,
+            .width = size.w,
+            .height = size.h,
             .x = windowW(model) / 2,
             .y = @max(0, windowH(model) - pet_edge_pad - spriteH(model) - bubble_gap),
             .resizable = false,
@@ -1136,12 +1940,12 @@ fn petWindows(model: *const Model, scratch: *PetApp.WindowsScratch) []const PetA
         };
     } else {
         scratch.windows[0] = .{
-            .label = "bubble",
+            .label = shown.label(),
             .canvas_label = "bubble-canvas",
-            .width = bubble_w,
-            .height = bubble_h,
-            .x = @floatCast(bubbleX(model, model.pet_x)),
-            .y = @floatCast(bubbleY(model.pet_y)),
+            .width = size.w,
+            .height = size.h,
+            .x = @floatCast(floatX(model, model.pet_x, size)),
+            .y = @floatCast(floatY(model, model.pet_y, size)),
             .resizable = false,
             .titlebar = .chromeless,
             .floating = true,
@@ -1152,21 +1956,79 @@ fn petWindows(model: *const Model, scratch: *PetApp.WindowsScratch) []const PetA
     return scratch.windows[0..1];
 }
 
-fn windowView(ui: *AppUi, model: *const Model, label: []const u8) AppUi.Node {
-    _ = label;
-    var text = ui.text(.{ .size = .sm }, model.bubble[0..model.bubble_len]);
-    text.widget.style.foreground = if (model.dark) canvas.Color.rgb8(237, 237, 238) else canvas.Color.rgb8(17, 17, 17);
-    var card = ui.el(.panel, .{ .padding = 10, .on_press = .bubble_click, .semantics = .{ .label = "Pet bubble" } }, .{text});
-    card.widget.style.radius = 14;
-    card.widget.style.stroke_width = 1;
+fn textColor(model: *const Model) canvas.Color {
+    return if (model.dark) canvas.Color.rgb8(237, 237, 238) else canvas.Color.rgb8(17, 17, 17);
+}
+
+/// The bubble / panel card look (the Electron bubble's).
+fn card(ui: *AppUi, model: *const Model, options: AppUi.ElementOptions, content: AppUi.Node) AppUi.Node {
+    var c = ui.el(.panel, options, .{content});
+    c.widget.style.radius = 14;
+    c.widget.style.stroke_width = 1;
     if (model.dark) {
-        card.widget.style.background = canvas.Color.rgb8(25, 25, 28);
-        card.widget.style.border = canvas.Color.rgba8(255, 255, 255, 26);
+        c.widget.style.background = canvas.Color.rgb8(25, 25, 28);
+        c.widget.style.border = canvas.Color.rgba8(255, 255, 255, 26);
     } else {
-        card.widget.style.background = canvas.Color.rgb8(255, 255, 255);
-        card.widget.style.border = canvas.Color.rgb8(214, 214, 220);
+        c.widget.style.background = canvas.Color.rgb8(255, 255, 255);
+        c.widget.style.border = canvas.Color.rgb8(214, 214, 220);
     }
-    return ui.column(.{ .grow = 1, .main = .end, .cross = .center }, .{card});
+    return c;
+}
+
+fn buttonNode(ui: *AppUi, label: []const u8, msg: Msg) AppUi.Node {
+    return ui.button(.{ .size = .sm, .variant = .outline, .on_press = msg, .semantics = .{ .label = label } }, label);
+}
+
+/// The button rows for `slots` wrapped inside `inner`; `msg_of(i)` is the
+/// press message of button `i`. Writes rows into `out`, returns them.
+fn buttonRows(ui: *AppUi, slots: []const ActionSlot, inner: f32, comptime tag: std.meta.Tag(Msg), out: []AppUi.Node) []AppUi.Node {
+    var row_of: [max_float_buttons]u8 = undefined;
+    const rows = wrapButtons(slots, inner, &row_of);
+    var start: usize = 0;
+    for (0..rows) |r| {
+        var end = start;
+        while (end < slots.len and row_of[end] == r) end += 1;
+        var buttons: [max_float_buttons]AppUi.Node = undefined;
+        for (start..end) |j| buttons[j - start] = buttonNode(ui, slots[j].label.slice(), @unionInit(Msg, @tagName(tag), @intCast(j)));
+        out[r] = ui.row(.{ .gap = button_gap }, buttons[0 .. end - start]);
+        start = end;
+    }
+    return out[0..rows];
+}
+
+fn bubbleView(ui: *AppUi, model: *const Model) AppUi.Node {
+    var text = ui.text(.{ .size = .sm }, model.bubble[0..model.bubble_len]);
+    text.widget.style.foreground = textColor(model);
+    const content = if (model.bubble_actions_len == 0) text else blk: {
+        const size = floatSize(model, .bubble_actions);
+        var rows: [max_float_buttons + 1]AppUi.Node = undefined;
+        rows[0] = text;
+        const buttons = buttonRows(ui, model.bubble_actions[0..model.bubble_actions_len], size.w - 2 * card_pad - 4, .bubble_action, rows[1..]);
+        break :blk ui.column(.{ .gap = 8 }, rows[0 .. 1 + buttons.len]);
+    };
+    // A click on the text opens its target; a button never does.
+    const c = card(ui, model, .{ .padding = 10, .on_press = .bubble_click, .semantics = .{ .label = "Pet bubble" } }, content);
+    return ui.column(.{ .grow = 1, .main = .end, .cross = .center }, .{c});
+}
+
+fn panelView(ui: *AppUi, model: *const Model) AppUi.Node {
+    var rows: [protocol.max_panel_lines + 1 + max_float_buttons]AppUi.Node = undefined;
+    var n: usize = 0;
+    for (model.panel_lines[0..model.panel_lines_len]) |*line| {
+        var t = ui.text(.{ .size = .sm }, line.slice());
+        t.widget.style.foreground = textColor(model);
+        rows[n] = t;
+        n += 1;
+    }
+    const size = floatSize(model, .panel);
+    n += buttonRows(ui, model.panel_actions[0..model.panel_actions_len], size.w - 2 * card_pad - 4, .panel_action, rows[n..]).len;
+    const c = card(ui, model, .{ .padding = 10, .semantics = .{ .label = "Pet panel" } }, ui.column(.{ .gap = 6 }, rows[0..n]));
+    return ui.column(.{ .grow = 1, .main = .end, .cross = .center }, .{c});
+}
+
+fn windowView(ui: *AppUi, model: *const Model, label: []const u8) AppUi.Node {
+    if (std.mem.eql(u8, label, "panel")) return panelView(ui, model);
+    return bubbleView(ui, model);
 }
 
 // ------------------------------------------------------------------ tray
@@ -1343,6 +2205,7 @@ pub fn main(init: std.process.Init) !void {
         .window_view = windowView,
         .tokens_fn = tokens,
         .on_appearance = onAppearance,
+        .on_key = onKey,
     });
     defer app_state.destroy();
     app_state.model = .{};
@@ -1365,4 +2228,5 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = protocol;
+    _ = motion;
 }

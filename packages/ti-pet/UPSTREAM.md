@@ -26,6 +26,12 @@ one bubble instead of a conversation stack, frames re-decoded per row instead
 of keeping the decoded sheet (saves ~13 MB per pet), and no hook server,
 agent hooks, SSH remotes, login, updater, settings window or `petdex://`.
 
+Not upstream: the round-3 states `look-a` / `look-b` (rows 9–10 of 8×11
+Petdex v2 sheets) live in `protocol.zig`'s `State`, which extends
+`sprite.State` in order (a comptime check keeps them aligned), because
+`src/sprite.zig` must stay a byte-identical copy. Their frame counts and
+durations come from the payload / timeline, never from `sprite.zig`.
+
 ## Native SDK patches
 
 `patches/ti-pet-sdk-linux-pointer.patch` (applied after upstream's own SDK

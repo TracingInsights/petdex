@@ -17,13 +17,24 @@
  *   spawn with Electron's argv (GDK_BACKEND=x11 on Linux) → hello / ready
  *   (pid must be the spawned process: the desktop's Windows pipe check needs
  *   it) → menu → show → render solo → render duo → bubble → hide → show →
+ *   round 3 live: the caps, a v2 look-around row (its v1 partner falls back
+ *   to idle), the partner's own animation (secondAnim), sleep (still frame +
+ *   "z z"), the answer badge, a dash and a roam walk (`position` with
+ *   walk: true), bubble buttons and the click panel (Linux: real clicks
+ *   through xdotool must come back as bubbleAction / panelAction; the panel
+ *   closes itself after 20 s → panelAction close) →
  *   write a timeline + handoff → ack → disconnect (Electron exits) → the
  *   timeline's moment lands in pet-native-state.json → reconnect with a new
- *   token (the next Electron adopts the pet) → quit → the process exits
+ *   token (the next Electron adopts the pet) → a v2 timeline + handoff →
+ *   disconnect → its greeting moment is recorded (Linux: the offline mute
+ *   button lands in `mutes`, a click opens the static panel and its button
+ *   starts the app with --pets-open) → reconnect → quit → the process exits
  *   and the socket is gone. macOS also launches a quarantined copy.
  *
  * The pet art is synthetic: a PNG atlas of flat coloured cells generated
- * here (magenta first pet, cyan second), never real pet art. Screenshots go
+ * here (magenta first pet, cyan second), never real pet art. Each cell
+ * carries a black notch whose x encodes its row, so a screenshot tells
+ * which row a sprite plays. Screenshots go
  * to the artifacts dir after each visible step; a missing screenshot tool
  * only warns. With --strict-pixels a screenshot without the pet's colour
  * (or with it while hidden) fails the run; without it that is a warning.
@@ -55,6 +66,10 @@ import { deflateSync, inflateSync } from 'node:zlib';
 
 const NATIVE_PROTOCOL_VERSION = 1;
 const TIMELINE_VERSION = 1;
+/** Round 3: written only to a pet whose ready.caps has 'timeline-v2'. */
+const TIMELINE_VERSION_V2 = 2;
+/** ready.caps a round-3 pet must list (protocol.zig `caps`). */
+const ROUND3_CAPS = ['motion', 'sleep', 'bubble-actions', 'panel', 'badge', 'second-anim', 'v2-rows', 'timeline-v2'];
 const NATIVE_STATE_VERSION = 1;
 const MAX_LINE_BYTES = 64 * 1024;
 const SOCKET_FILE = 'pet.sock';
@@ -66,9 +81,11 @@ const MAX_UNIX_SOCKET_PATH = 100;
 const HANDOFF_ACK_MS = 1000;
 const TO_NATIVE_KINDS = ['hello', 'show', 'hide', 'render', 'menu', 'handoff', 'quit'];
 const FROM_NATIVE_KINDS = ['ready', 'event', 'position', 'menuAction', 'ack', 'error'];
-const NATIVE_EVENTS = ['drag', 'dragEnd', 'click', 'dblclick', 'hover', 'bubbleClick'];
+const NATIVE_EVENTS = ['drag', 'dragEnd', 'click', 'dblclick', 'hover', 'bubbleClick', 'bubbleAction', 'panelAction'];
 const MENU_ID_RE = /^[a-z0-9.-]{1,64}$/;
-const MARKER_SETTINGS = ['lastResultKey', 'lastRateKey', 'lastFactDay'];
+const ACTION_ID_RE = /^[a-z0-9-]{1,32}$/;
+const MARKER_SETTINGS = ['lastResultKey', 'lastRateKey', 'lastFactDay', 'lastGreetingKey'];
+const BUBBLE_KIND_RE = /^[a-z-]{1,24}$/;
 
 function nativeSocketPath({ platform, userDataDir, tmpDir }) {
   const hash = createHash('sha256').update(userDataDir).digest('hex').slice(0, 16);
@@ -107,12 +124,15 @@ function validateFromNative(raw) {
       };
     case 'event':
       if (!NATIVE_EVENTS.includes(raw.event)) return null;
+      if (raw.event === 'bubbleAction' || raw.event === 'panelAction') {
+        return typeof raw.id === 'string' && ACTION_ID_RE.test(raw.id) ? { kind: 'event', event: raw.event, id: raw.id } : null;
+      }
       if (raw.event !== 'drag') return { kind: 'event', event: raw.event };
       if (!finiteIn(raw.dx, 10_000) || !finiteIn(raw.dy, 10_000)) return null;
       return { kind: 'event', event: 'drag', dx: raw.dx, dy: raw.dy };
     case 'position':
       if (!finiteIn(raw.x, 1e6) || !finiteIn(raw.y, 1e6)) return null;
-      return { kind: 'position', x: Math.round(raw.x), y: Math.round(raw.y) };
+      return { kind: 'position', x: Math.round(raw.x), y: Math.round(raw.y), walk: raw.walk === true };
     case 'menuAction':
       if (typeof raw.id !== 'string' || !MENU_ID_RE.test(raw.id)) return null;
       return { kind: 'menuAction', id: raw.id };
@@ -140,7 +160,8 @@ function parseNativeState(raw) {
       }
     }
   }
-  return { updatedAt: raw.updatedAt, markers };
+  const mutes = Array.isArray(raw.mutes) ? raw.mutes.filter((k) => typeof k === 'string' && BUBBLE_KIND_RE.test(k)) : [];
+  return { updatedAt: raw.updatedAt, markers, mutes };
 }
 
 // ------------------------------------------------------------------ args
@@ -242,27 +263,36 @@ const CELL_H = 208;
 const COLS = 8;
 const ROWS = 9;
 const COLORS = { first: [255, 0, 255], second: [0, 255, 255] };
+const MARGIN = 24;
+/** Row notch: a black NOTCH_W x 10 block at x MARGIN + NOTCH_X0 + row * NOTCH_STEP. */
+const NOTCH_X0 = 6;
+const NOTCH_STEP = 12;
+const NOTCH_W = 9;
+const NOTCH_Y0 = 180;
+const NOTCH_Y1 = 190;
 
 /**
- * A v1 atlas (8x9 cells of 192x208): every cell a flat block of `color`
- * with a transparent margin and a black bar whose height moves with the
- * frame, so the animation is visible in a screenshot sequence.
+ * An atlas (8 x `rows` cells of 192x208; 9 = v1, 11 = v2): every cell a
+ * flat block of `color` with a transparent margin, a black bar whose
+ * height moves with the frame (the animation is visible in a screenshot
+ * sequence) and a black notch whose x is the row.
  */
-function syntheticAtlas([r, g, b]) {
+function syntheticAtlas([r, g, b], rows = ROWS) {
   const width = CELL_W * COLS;
-  const height = CELL_H * ROWS;
+  const height = CELL_H * rows;
   const px = Buffer.alloc(width * height * 4);
-  const margin = 24;
-  for (let row = 0; row < ROWS; row += 1) {
+  for (let row = 0; row < rows; row += 1) {
+    const notchX = MARGIN + NOTCH_X0 + row * NOTCH_STEP;
     for (let col = 0; col < COLS; col += 1) {
-      const barTop = margin + 20 + col * 16;
-      for (let y = margin; y < CELL_H - margin / 2; y += 1) {
+      const barTop = MARGIN + 20 + col * 16;
+      for (let y = MARGIN; y < CELL_H - MARGIN / 2; y += 1) {
         const bar = y >= barTop && y < barTop + 12;
-        for (let x = margin; x < CELL_W - margin; x += 1) {
+        for (let x = MARGIN; x < CELL_W - MARGIN; x += 1) {
+          const notch = y >= NOTCH_Y0 && y < NOTCH_Y1 && x >= notchX && x < notchX + NOTCH_W;
           const i = ((row * CELL_H + y) * width + col * CELL_W + x) * 4;
-          px[i] = bar ? 0 : r;
-          px[i + 1] = bar ? 0 : g;
-          px[i + 2] = bar ? 0 : b;
+          px[i] = bar || notch ? 0 : r;
+          px[i + 1] = bar || notch ? 0 : g;
+          px[i + 2] = bar || notch ? 0 : b;
           px[i + 3] = 255;
         }
       }
@@ -272,7 +302,7 @@ function syntheticAtlas([r, g, b]) {
 }
 
 /** userData/pets/<id>/{pet.json, spritesheet.png} like the pet store. */
-function writePet(userDataDir, id, color) {
+function writePet(userDataDir, id, color, rows = ROWS) {
   const dir = join(userDataDir, 'pets', id);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
@@ -280,7 +310,7 @@ function writePet(userDataDir, id, color) {
     `${JSON.stringify({ id, displayName: `Smoke ${id}`, description: 'Synthetic smoke-test pet (flat colour cells).', spritesheetPath: 'spritesheet.png' }, null, 2)}\n`
   );
   const sheet = join(dir, 'spritesheet.png');
-  writeFileSync(sheet, syntheticAtlas(color));
+  writeFileSync(sheet, syntheticAtlas(color, rows));
   return sheet;
 }
 
@@ -421,6 +451,83 @@ function bubbleBox(img, before) {
   }
   const box = denseBox(fresh, rows, width, { rowMin: 2, rowGap: 6, colMin: 1, colGap: 12 });
   return box && box.px >= 150 ? box : null;
+}
+
+/** Box of one pet's colour (1 = first / magenta, 2 = second / cyan), or null. */
+function colourBox(img, kind) {
+  const { data, channels, width, height } = img;
+  const mask = new Uint8Array(width * height);
+  const rows = new Array(height).fill(0);
+  for (let i = 0, p = 0; i + 2 < data.length; i += channels, p += 1) {
+    if (petColour(data[i], data[i + 1], data[i + 2]) !== kind) continue;
+    mask[p] = 1;
+    rows[Math.floor(p / width)] += 1;
+  }
+  return denseBox(mask, rows, width, { rowMin: 20, rowGap: 16, colMin: 5, colGap: 120 });
+}
+
+const black = (data, i) => data[i] < 60 && data[i + 1] < 60 && data[i + 2] < 60;
+
+/**
+ * The atlas row a pet's sprite shows, read off its notch (syntheticAtlas),
+ * or null when no notch is found.
+ */
+function rowOf(img, kind) {
+  const box = colourBox(img, kind);
+  if (!box) return null;
+  const s = (box.maxX - box.minX + 1) / (CELL_W - 2 * MARGIN);
+  const y = Math.round(box.minY + ((NOTCH_Y0 + NOTCH_Y1) / 2 - MARGIN) * s);
+  if (y < 0 || y >= img.height) return null;
+  let best = null;
+  let start = null;
+  for (let x = box.minX; x <= box.maxX + 1; x += 1) {
+    const dark = x <= box.maxX && black(img.data, (y * img.width + x) * img.channels);
+    if (dark && start === null) start = x;
+    if (!dark && start !== null) {
+      const w = x - start;
+      if (w >= NOTCH_W * s * 0.5 && w <= NOTCH_W * s * 2 && !best) best = { from: start, to: x - 1 };
+      start = null;
+    }
+  }
+  if (!best) return null;
+  const mid = (best.from + best.to) / 2;
+  const xo = (mid - box.minX) / s + MARGIN;
+  return Math.round((xo - (MARGIN + NOTCH_X0 + NOTCH_W / 2)) / NOTCH_STEP);
+}
+
+/** Red badge-dot pixels (main.zig withMarks: rgb 239, 68, 68). */
+function badgePixels(img) {
+  const { data, channels } = img;
+  let n = 0;
+  for (let i = 0; i + 2 < data.length; i += channels) {
+    if (data[i] > 200 && data[i + 1] < 110 && data[i + 2] < 110) n += 1;
+  }
+  return n;
+}
+
+/** Blue-grey "z z" pixels (main.zig withMarks, dark or light), cyan excluded. */
+function zzPixels(img) {
+  const { data, channels } = img;
+  let n = 0;
+  for (let i = 0; i + 2 < data.length; i += channels) {
+    const [r, g, b] = [data[i], data[i + 1], data[i + 2]];
+    if (g > 190 && r < 80) continue;
+    if (r >= 60 && g >= 60 && b - r >= 20 && b - g >= 10 && b <= 245) n += 1;
+  }
+  return n;
+}
+
+/** Both shots show the same pixels inside `box` (a still frame). */
+function sameInBox(a, b, box) {
+  if (!a || !b || !box || a.width !== b.width || a.height !== b.height) return false;
+  for (let y = box.minY; y <= box.maxY; y += 1) {
+    for (let x = box.minX; x <= box.maxX; x += 1) {
+      const i = (y * a.width + x) * a.channels;
+      const j = (y * b.width + x) * b.channels;
+      if (a.data[i] !== b.data[j] || a.data[i + 1] !== b.data[j + 1] || a.data[i + 2] !== b.data[j + 2]) return false;
+    }
+  }
+  return true;
 }
 
 function haveTool(cmd, args = ['-version']) {
@@ -566,6 +673,18 @@ function shotProblems(img, expect, before) {
   if (expect.second === true && pets.second < MIN_PET_PX) problems.push('second pet not visible');
   if (expect.first === false && pets.first >= MIN_PET_PX) problems.push('first pet visible while hidden');
   if (expect.second === false && pets.second >= MIN_PET_PX) problems.push('second pet visible');
+  // Round 3: rows (v2 look-around, the partner's fallback / own row, the walk).
+  for (const [who, kind] of [['first', 1], ['second', 2]]) {
+    const want = expect.rows?.[who];
+    if (want === undefined || problems.length > 0) continue;
+    const got = rowOf(img, kind);
+    const ok = Array.isArray(want) ? want.includes(got) : got === want;
+    if (!ok) problems.push(`${who} pet shows row ${got}, want ${JSON.stringify(want)}`);
+  }
+  if (expect.badge === true && badgePixels(img) < 30) problems.push(`no badge dot (${badgePixels(img)} red px)`);
+  if (expect.badge === false && badgePixels(img) >= 10) problems.push('badge dot while none is set');
+  if (expect.zz === true && zzPixels(img) < 12) problems.push(`no "z z" mark (${zzPixels(img)} px)`);
+  if (expect.zz === false && zzPixels(img) >= 12) problems.push('"z z" mark while awake');
   const result = { pets, bubble: null, problems, bubbleProblems: [] };
   if (!expect.bubble || problems.length > 0 || !pets.box) return result;
   const bubble = bubbleBox(img, before);
@@ -626,6 +745,75 @@ async function capture(name, expect, { before = null } = {}) {
   warn(text);
 }
 
+/** A second shot of `name`'s scene: the pets must not have changed (still frame). */
+async function stillCheck(name) {
+  const first = images.get(name);
+  if (!first) return;
+  await sleep(900);
+  const again = takeShot(name, join(opts.artifacts, `${String(shots.length).padStart(2, '0')}-${name}-again.png`));
+  if (!again) return;
+  if (sameInBox(first, again, petPixels(first).box)) return pass(`${name}: the frame stays still`);
+  const text = `${name}: the pets changed between two shots of a still frame`;
+  if (opts.strictPixels) fail(text);
+  warn(text);
+}
+
+// ------------------------------------------------------- pointer (Linux)
+
+/** Linux with xdotool: real pointer input into the pet's X11 windows. */
+const canClick = () => platform === 'linux' && petPid !== null && haveTool('xdotool', ['version']);
+const xdo = (args) => execFileSync('xdotool', args, { encoding: 'utf8', timeout: 10_000 });
+
+function xGeom(id) {
+  const geo = execFileSync('xwininfo', ['-id', id], { encoding: 'utf8', timeout: 10_000 });
+  const num = (re) => Number(re.exec(geo)?.[1] ?? NaN);
+  return { x: num(/Absolute upper-left X:\s*(-?\d+)/), y: num(/Absolute upper-left Y:\s*(-?\d+)/), w: num(/Width:\s*(\d+)/), h: num(/Height:\s*(\d+)/) };
+}
+
+/** The pet's visible windows: the pet (the largest) and its bubble / panel. */
+function petXWindows() {
+  let ids = [];
+  try {
+    ids = xdo(['search', '--onlyvisible', '--pid', String(petPid)]).split('\n').filter((id) => /^\d+$/.test(id));
+  } catch {
+    // none visible
+  }
+  const wins = ids.map((id) => ({ id, ...xGeom(id) })).filter((w) => w.w > 2 && w.h > 2);
+  wins.sort((a, b) => b.w * b.h - a.w * a.h);
+  return { main: wins[0] ?? null, float: wins[1] ?? null };
+}
+
+function pointerTo(x, y) {
+  xdo(['mousemove', '--sync', String(Math.round(x)), String(Math.round(y))]);
+}
+
+async function clickAt(x, y) {
+  pointerTo(x, y);
+  await sleep(150);
+  xdo(['click', '1']);
+}
+
+/**
+ * Click along a horizontal band of `win` (`yFromBottom` above its bottom
+ * edge) until `done()`; resolves the point that did it, or null. Buttons
+ * sit on the card's last row; a click beside them lands on the card.
+ */
+async function clickScan(win, { yFromBottom, fromRight = false, step = 12 }, done, waitMs = 500) {
+  const y = win.y + win.h - yFromBottom;
+  const xs = [];
+  for (let x = win.x + 14; x <= win.x + win.w - 14; x += step) xs.push(x);
+  if (fromRight) xs.reverse();
+  for (const x of xs) {
+    await clickAt(x, y);
+    const t0 = Date.now();
+    while (Date.now() - t0 < waitMs) {
+      if (done()) return { x, y };
+      await sleep(50);
+    }
+  }
+  return null;
+}
+
 // ------------------------------------------------------------ connection
 
 /** One Electron connection: hello → ready, then lines both ways. */
@@ -681,6 +869,7 @@ function connect(socketPath, token, timeoutMs) {
           resolvePromise(api);
           continue;
         }
+        message.at = Date.now();
         received.push(message);
         notify();
       }
@@ -848,19 +1037,21 @@ const menu = {
   ]
 };
 
-function renderPayload(sheets, { duo = false, bubble = null, state = 'idle', row = 0, frames = 6, durationMs = 1100, playKey = 'idle' } = {}) {
+function renderPayload(sheets, { duo = false, bubble = null, state = 'idle', row = 0, frames = 6, durationMs = 1100, playKey = 'idle', still = false, first = null, extra = {} } = {}) {
   return {
     state,
     row,
     frames,
     durationMs,
     once: false,
-    still: false,
+    still,
     playKey,
     bubble,
     size: 'm',
-    atlas: { path: sheets.first, rows: 9, scale: 1 },
-    second: duo ? { path: sheets.second, rows: 9, scale: 1 } : null
+    atlas: first ?? { path: sheets.first, rows: 9, scale: 1 },
+    second: duo ? { path: sheets.second, rows: 9, scale: 1 } : null,
+    // round 3 (motion, sleeping, bubbleActions, panel, badge, secondAnim)
+    ...extra
   };
 }
 
@@ -921,6 +1112,58 @@ function timelineDoc(sheets, nowMs, today) {
   };
 }
 
+/**
+ * A v2 timeline (round 3): an 11-row first sheet, a greeting moment whose
+ * bubble has OK / mute buttons and whose partner waves late, and a static
+ * click panel whose buttons open the app.
+ */
+function timelineDocV2(sheets, nowMs, today, greetingKey) {
+  const doc = timelineDoc(sheets, nowMs, today);
+  doc.v = TIMELINE_VERSION_V2;
+  doc.pets.first = { id: 'smoke-c', path: sheets.firstV2, rows: 11, scale: 1 };
+  doc.entries[0] = {
+    ...doc.entries[0],
+    bubble: 'Race weekend · Smoke GP',
+    bubbleTarget: '/',
+    moment: { name: 'lastGreetingKey', value: greetingKey },
+    motion: null,
+    sleeping: false,
+    bubbleActions: [
+      { id: 'ok', label: 'OK' },
+      { id: 'mute', label: 'No greetings' }
+    ],
+    bubbleKind: 'greeting',
+    secondAnim: { state: 'waving', row: 3, frames: 4, durationMs: 700, once: true, still: false, playKey: 'greeting:second', delayMs: 700 }
+  };
+  doc.panel = {
+    lines: ['Smoke A P1 · Smoke GP'],
+    countdown: true,
+    actions: [
+      { id: 'stats', label: 'On this day', target: '/stats/on-this-day' },
+      { id: 'pets', label: 'Pets', target: '/settings/pets' }
+    ]
+  };
+  return doc;
+}
+
+function readState(statePath) {
+  try {
+    return parseNativeState(JSON.parse(readFileSync(statePath, 'utf8')));
+  } catch {
+    return null;
+  }
+}
+
+async function waitForState(statePath, pred, ms) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const st = readState(statePath);
+    if (st && pred(st)) return st;
+    await sleep(200);
+  }
+  return null;
+}
+
 // ------------------------------------------------------------------ main
 
 const summary = { platform, arch: process.arch, binary: opts.binary, ok: false, steps: passed, warnings, screenshots: shots };
@@ -932,7 +1175,9 @@ async function smoke(cleanup) {
   info(`userData ${userDataDir}`);
   const sheets = {
     first: writePet(userDataDir, 'smoke-a', COLORS.first),
-    second: writePet(userDataDir, 'smoke-b', COLORS.second)
+    second: writePet(userDataDir, 'smoke-b', COLORS.second),
+    // v2 (8x11) sheet, same colour as the first pet
+    firstV2: writePet(userDataDir, 'smoke-c', COLORS.first, 11)
   };
   const socketPath = nativeSocketPath({ platform, userDataDir, tmpDir: tmpdir() });
   const tokenPath = join(userDataDir, TOKEN_FILE);
@@ -964,6 +1209,8 @@ async function smoke(cleanup) {
   });
   petPid = pet.child.pid;
   info(`spawned ti-pet pid ${pet.child.pid}: ${pet.args.join(' ')}`);
+  // Off the pet before it shows: a hover would hold its walk back 30 s.
+  if (canClick()) pointerTo(2, 2);
   let early = null;
   void pet.exit.then((r) => {
     early = r;
@@ -1021,6 +1268,8 @@ async function smoke(cleanup) {
   conn.check('show again');
   pass('show after hide accepted');
 
+  await roundThreeLive(conn, ready, sheets);
+
   // --- handoff
   const nowMs = Date.now();
   const today = new Date(nowMs).toISOString().slice(0, 10);
@@ -1076,9 +1325,16 @@ async function smoke(cleanup) {
   await sleep(300);
   again.check('menu after adopt');
 
+  // --- round 3 offline: a v2 timeline, then the next Electron adopts again
+  await roundThreeOffline(again, { sheets, timelinePath, statePath, today, appLog });
+  writeToken(tokenPath);
+  const last = await connectUntil(socketPath, tokenPath, Date.now() + opts.timeoutMs, () => socketIsSafe(socketPath));
+  if (last.ready.pid !== ready.pid) fail(`adopted pet reports pid ${last.ready.pid}, was ${ready.pid}`);
+  pass('reconnect after the v2 timeline → ready (adopt)');
+
   // --- quit
-  again.send({ kind: 'quit' });
-  const closedMs = await again.waitFor(() => again.closed, opts.timeoutMs);
+  last.send({ kind: 'quit' });
+  const closedMs = await last.waitFor(() => last.closed, opts.timeoutMs);
   if (closedMs === null) fail('connection still open after quit');
   const exit = await exitedWithin(pet.exit, opts.timeoutMs);
   if (!exit) fail(`ti-pet still running ${opts.timeoutMs} ms after quit`);
@@ -1097,8 +1353,209 @@ async function smoke(cleanup) {
   }
 
   if (existsSync(appLog)) {
-    warn(`the pet launched the app during the smoke: ${readFileSync(appLog, 'utf8').trim()}`);
+    // Offline clicks (bubble text, panel buttons) start the app on purpose.
+    const other = readFileSync(appLog, 'utf8').trim().split('\n').filter((l) => l && !l.includes('--pets-open='));
+    if (other.length > 0) warn(`the pet launched the app during the smoke: ${other.join(' | ')}`);
   }
+}
+
+/** Round 3 while Electron drives: what the payload carries is drawn, button presses come back. */
+async function roundThreeLive(conn, ready, sheets) {
+  const missing = ROUND3_CAPS.filter((c) => !ready.caps.includes(c));
+  if (missing.length > 0) fail(`ready.caps lacks round-3 capabilities: ${missing.join(', ')}`);
+  pass(`ready.caps lists round 3 (${ROUND3_CAPS.join(', ')})`);
+  // Keep the pointer off the pet: a hover stops walking.
+  if (canClick()) pointerTo(2, 2);
+
+  // A v2 look-around row on the 11-row sheet; the 9-row partner plays idle.
+  const v2 = { path: sheets.firstV2, rows: 11, scale: 1 };
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, first: v2, state: 'look-a', row: 9, frames: 8, durationMs: 1120, playKey: 'look-a:1' }) });
+  await capture('look-a', { first: true, second: true, rows: { first: 9, second: 0 } });
+  conn.check('look-a');
+  pass('v2 look-around row accepted');
+
+  // The partner's own reaction (secondAnim), started late.
+  const wave = { state: 'waving', row: 3, frames: 4, durationMs: 700, once: false, still: false, playKey: 'duo-wave', delayMs: 300 };
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, extra: { secondAnim: wave } }) });
+  await capture('second-anim', { first: true, second: true, rows: { first: 0, second: 3 } });
+  conn.check('secondAnim');
+  pass('secondAnim accepted');
+
+  // Asleep: a still frame and the "z z" mark.
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, still: true, extra: { sleeping: true } }) });
+  await capture('sleeping', { first: true, second: true, zz: true, badge: false });
+  await stillCheck('sleeping');
+  conn.check('sleeping');
+  pass('sleeping accepted');
+
+  // The answer-ready badge (the pet is awake again: no "z z").
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, extra: { badge: { kind: 'answer', label: 'Answer ready' } } }) });
+  await capture('badge', { first: true, second: true, badge: true, zz: false });
+  conn.check('badge');
+  pass('badge accepted');
+
+  // A dash: out to an edge and back to where it started, at once.
+  const start = canClick() ? petXWindows().main : null;
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, playKey: 'calendar:smoke:live', extra: { motion: 'dash' } }) });
+  if (start) {
+    let far = 0;
+    let back = false;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 12_000) {
+      await sleep(120);
+      const w = petXWindows().main;
+      if (!w) continue;
+      far = Math.max(far, Math.abs(w.x - start.x));
+      if (far > 60 && Math.abs(w.x - start.x) <= 2) {
+        back = true;
+        break;
+      }
+    }
+    if (far <= 60) fail(`dash: the pet did not run (moved ${far} px)`);
+    if (!back) fail('dash: the pet did not come back to where it started');
+    pass(`dash: ran ${far} px and came back in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+    // Back where it started: nothing to save (a walk saves only when it moved).
+    await sleep(300);
+    if (conn.received.some((m) => m.kind === 'position' && m.walk)) fail('dash: saved a position though it came back');
+  } else {
+    await sleep(9000);
+  }
+  conn.check('dash');
+
+  // A roam walk: a pause (10–40 s), a walk, then `position` with walk: true.
+  const sinceRoam = conn.received.length;
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, extra: { motion: 'roam' } }) });
+  const before = canClick() ? petXWindows().main : null;
+  let walkingRow = null;
+  const walked = () => conn.received.slice(sinceRoam).find((m) => m.kind === 'position' && m.walk);
+  const t1 = Date.now();
+  // A hover keeps the pet from roaming for 30 s; then a 10–40 s pause and the walk.
+  const lastHover = Math.max(0, ...conn.received.filter((m) => m.event === 'hover').map((m) => m.at));
+  const roamDeadline = Math.max(t1, lastHover + 30_000) + 50_000;
+  while (!walked() && Date.now() < roamDeadline) {
+    await sleep(250);
+    if (!before || walkingRow !== null) continue;
+    const w = petXWindows().main;
+    if (w && Math.abs(w.x - before.x) > 8) {
+      const img = takeShot('walking', join(opts.artifacts, 'walking.png'));
+      walkingRow = img ? rowOf(img, 1) : -1;
+    }
+  }
+  const walk = walked();
+  if (!walk) fail(`roam: no walk ended within ${Math.round((roamDeadline - t1) / 1000)} s (no position with walk: true)`);
+  pass(`roam: walked, then position walk: true (x ${walk.x}) after ${((Date.now() - t1) / 1000).toFixed(1)} s`);
+  if (walkingRow !== null && walkingRow !== -1) {
+    if (walkingRow === 1 || walkingRow === 2) pass(`roam: running row ${walkingRow} while walking`);
+    else if (opts.strictPixels) fail(`roam: row ${walkingRow} while walking (want 1 or 2)`);
+    else warn(`roam: row ${walkingRow} while walking (want 1 or 2)`);
+  }
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true }) });
+  conn.check('roam');
+
+  // Buttons under the bubble: a real click comes back as bubbleAction.
+  const actions = [
+    { id: 'ok', label: 'OK' },
+    { id: 'quiet-1h', label: 'Quiet 1 h' },
+    { id: 'mute', label: 'No daily facts' }
+  ];
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, bubble: 'Smoke test · bubble buttons', extra: { bubbleActions: actions } }) });
+  await capture('bubble-actions', { first: true, second: true, bubble: true }, { before: 'second-anim' });
+  conn.check('bubble-actions');
+  pass('bubble with buttons accepted');
+  if (canClick()) {
+    const { float } = petXWindows();
+    if (!float) fail('bubble-actions: no bubble window to click');
+    const action = () => conn.received.find((m) => m.kind === 'event' && m.event === 'bubbleAction');
+    if (!(await clickScan(float, { yFromBottom: 24 }, () => Boolean(action())))) {
+      fail('bubble-actions: no click on the button row came back as bubbleAction');
+    }
+    pass(`bubble button click → event bubbleAction ${action().id}`);
+    pointerTo(2, 2);
+  } else {
+    warn('bubble buttons: no xdotool on this runner, clicks not checked');
+  }
+
+  // The click panel: a button click comes back as panelAction; the pet
+  // closes the panel itself after 20 s without the pointer (panelAction
+  // with id 'close', contract.mjs PANEL_CLOSE_ID).
+  const panel = {
+    lines: ['Race in 2 h · Smoke GP', 'Smoke A P1 · Smoke GP'],
+    actions: [
+      { id: 'ask', label: 'Ask F1' },
+      { id: 'stats', label: 'On this day' },
+      { id: 'pets', label: 'Pets' }
+    ]
+  };
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, extra: { panel } }) });
+  await capture('panel', { first: true, second: true, bubble: true }, { before: 'second-anim' });
+  conn.check('panel');
+  pass('panel accepted');
+  if (canClick()) {
+    const { float } = petXWindows();
+    if (!float) fail('panel: no panel window to click');
+    const action = () => conn.received.find((m) => m.kind === 'event' && m.event === 'panelAction' && m.id !== 'close');
+    if (!(await clickScan(float, { yFromBottom: 26 }, () => Boolean(action())))) {
+      fail('panel: no click on the button row came back as panelAction');
+    }
+    pass(`panel button click → event panelAction ${action().id}`);
+    pointerTo(2, 2);
+  }
+  const closed = (m) => m.kind === 'event' && m.event === 'panelAction' && m.id === 'close';
+  const closeMs = await conn.waitFor(() => conn.received.some(closed), 24_000);
+  if (closeMs === null) fail('panel: no panelAction close within 24 s of the pointer leaving');
+  pass(`panel closed itself → event panelAction close (${(closeMs / 1000).toFixed(1)} s later)`);
+  // Electron answers with a render without the panel.
+  conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true }) });
+  conn.check('panel closed');
+}
+
+/** Round 3 with Electron gone: a v2 timeline plays; offline buttons work. */
+async function roundThreeOffline(conn, { sheets, timelinePath, statePath, today, appLog }) {
+  const greetingKey = `${today}:evening`;
+  writeFileSync(timelinePath, `${JSON.stringify(timelineDocV2(sheets, Date.now(), today, greetingKey), null, 2)}\n`);
+  conn.send({ kind: 'handoff', timelinePath });
+  const ackMs = await conn.waitFor(() => conn.received.some((m) => m.kind === 'ack' || m.kind === 'error'), 3000);
+  conn.check('handoff v2');
+  if (ackMs === null) fail('no ack for the v2 timeline within 3 s');
+  pass(`v2 timeline handoff → ack in ${ackMs} ms`);
+  conn.end();
+  await conn.waitFor(() => conn.closed, 3000);
+  if (canClick()) pointerTo(2, 2);
+
+  const st = await waitForState(statePath, (s) => s.markers.some((m) => m.name === 'lastGreetingKey' && m.value === greetingKey), 8000);
+  if (!st) fail(`the v2 greeting moment never reached ${NATIVE_STATE_FILE}`);
+  pass('v2 greeting moment recorded in pet-native-state.json');
+  await capture('timeline-v2', { first: true, second: true, bubble: true, rows: { first: 0, second: 3 } }, { before: 'shown-again' });
+
+  if (!canClick()) {
+    warn('offline buttons: no xdotool on this runner, clicks not checked');
+    return;
+  }
+  // The mute button (the rightmost) records the bubble's kind for Electron.
+  const { float } = petXWindows();
+  if (!float) fail('timeline-v2: no bubble window to click');
+  const muted = () => readState(statePath)?.mutes.includes('greeting');
+  if (!(await clickScan(float, { yFromBottom: 24, fromRight: true }, muted))) {
+    fail('offline mute: pet-native-state.json never got mutes: ["greeting"]');
+  }
+  pass('offline mute button → mutes: ["greeting"] in pet-native-state.json');
+  pointerTo(2, 2);
+  await sleep(600);
+
+  // A click on the pet opens the timeline's panel; its button starts the app.
+  const { main } = petXWindows();
+  if (!main) fail('offline: the pet window is gone');
+  await clickAt(main.x + main.w * 0.75, main.y + main.h * 0.55);
+  await sleep(1500);
+  const panelWin = petXWindows().float;
+  if (!panelWin) fail('offline click: no panel opened');
+  pass(`offline click opened the panel (${panelWin.w}x${panelWin.h})`);
+  const opened = () => existsSync(appLog) && readFileSync(appLog, 'utf8').includes('--pets-open=/stats/on-this-day');
+  if (!(await clickScan(panelWin, { yFromBottom: 26 }, opened, 900))) {
+    fail('offline panel: no button click started the app with --pets-open=/stats/on-this-day');
+  }
+  pass('offline panel button → app started with --pets-open=/stats/on-this-day');
+  pointerTo(2, 2);
 }
 
 /** macOS: does a copy carrying com.apple.quarantine still launch? (report only) */

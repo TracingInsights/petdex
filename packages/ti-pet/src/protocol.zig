@@ -11,11 +11,30 @@
 //! kind or a field of the wrong type rejects the line (the caller drops the
 //! connection, as the desktop side does), unknown keys are ignored so a
 //! newer desktop can add fields without breaking an older pet.
+//!
+//! Round 3 grew the render payload without a version bump (both sides
+//! require an equal `protocol` at hello / ready, so a bump would turn every
+//! skew into "no native pet"). Instead the pet lists what it draws in
+//! `ready.caps` (`caps` below) and Electron leaves out what an older pet
+//! lacks. Every new field defaults to "nothing new", and its unknown
+//! *values* (a future motion, badge kind or second-sprite state) are read
+//! as that default rather than rejecting the line. The new events
+//! (bubbleAction, panelAction — `close` included, when the pet shuts the
+//! panel itself) are only ever sent in answer to a field only a newer
+//! Electron sends, so an older Electron never sees one.
 
 const std = @import("std");
 const sprite = @import("sprite.zig");
 
 pub const protocol_version: u32 = 1;
+/// What this pet draws (`ready.caps`): v1's four, then round 3's. Electron
+/// strips a payload field whose cap is missing (native-protocol.mjs).
+pub const caps = [_][]const u8{
+    "duo",    "bubble",      "menu",           "timeline",
+    // round 3
+    "motion", "sleep",       "bubble-actions", "panel",
+    "badge",  "second-anim", "v2-rows",        "timeline-v2",
+};
 pub const max_line_bytes: usize = 64 * 1024;
 pub const max_path_bytes: usize = 1024;
 pub const max_text_bytes: usize = 600;
@@ -23,6 +42,19 @@ pub const max_menu_items: usize = 32;
 pub const max_menu_id_bytes: usize = 64;
 pub const max_menu_label_bytes: usize = 96;
 pub const token_hex_len: usize = 64;
+/// Bubble buttons (SPEC 2e: at most three; more are dropped).
+pub const max_bubble_actions: usize = 3;
+/// Click panel (SPEC 3a): lines and buttons beyond these are dropped.
+pub const max_panel_lines: usize = 3;
+pub const max_panel_actions: usize = 6;
+/// 60 characters of up to four UTF-8 bytes.
+pub const max_panel_line_bytes: usize = 240;
+pub const max_action_id_bytes: usize = 32;
+pub const max_action_label_bytes: usize = 64;
+pub const max_badge_label_bytes: usize = 64;
+pub const max_play_key_bytes: usize = 128;
+/// A second-sprite animation may start this late at most (duo waves).
+pub const max_delay_ms: u32 = 10_000;
 
 pub const Size = enum {
     s,
@@ -39,6 +71,70 @@ pub const Size = enum {
     }
 };
 
+/// Animation states: upstream's nine (sprite.zig, same order) plus the
+/// two look-around rows of 8x11 (Petdex v2) sheets. sprite.zig stays a
+/// byte-identical upstream copy, so the extension lives here.
+pub const State = enum(u8) {
+    idle,
+    @"running-right",
+    @"running-left",
+    waving,
+    jumping,
+    failed,
+    waiting,
+    running,
+    review,
+    @"look-a",
+    @"look-b",
+
+    pub fn fromSprite(s: sprite.State) State {
+        return @enumFromInt(@intFromEnum(s));
+    }
+};
+
+comptime {
+    for (std.meta.fields(sprite.State)) |f| {
+        if (!std.mem.eql(u8, f.name, @tagName(@as(State, @enumFromInt(f.value))))) {
+            @compileError("protocol.State must start with sprite.State, in order");
+        }
+    }
+}
+
+/// Renderer-owned motion (SPEC 2a): wander while ambient, or one run
+/// across the display and back at a session start.
+pub const Motion = enum { roam, dash };
+
+/// One button: a bubble action (ok, quiet-1h, quiet-session, mute) or a
+/// panel action (ask, rate, stats, hot-lap, pets). Ids are not checked
+/// against those lists here (Electron validates what comes back), only
+/// against `actionIdOk`, so a newer Electron can add one.
+pub const Action = struct {
+    id: []const u8,
+    label: []const u8,
+};
+
+pub const Panel = struct {
+    lines: []const []const u8,
+    actions: []const Action,
+};
+
+pub const Badge = struct {
+    label: []const u8,
+};
+
+/// An animation: the render payload's own fields, or `secondAnim` (the
+/// duo partner's own reaction, started `delay_ms` late).
+pub const Anim = struct {
+    state: State,
+    row: u8,
+    frames: u8,
+    duration_ms: u32,
+    once: bool = false,
+    still: bool = false,
+    play_key: []const u8 = "",
+    delay_ms: u32 = 0,
+};
+
 pub const Sprite = struct {
     path: []const u8,
     /// Atlas rows (9 = v1, 11 = v2).
@@ -48,7 +144,7 @@ pub const Sprite = struct {
 };
 
 pub const Render = struct {
-    state: sprite.State,
+    state: State,
     row: u8,
     frames: u8,
     duration_ms: u32,
@@ -59,6 +155,28 @@ pub const Render = struct {
     size: Size,
     atlas: Sprite,
     second: ?Sprite,
+    // --- round 3; each defaults to "nothing new" ---
+    motion: ?Motion = null,
+    /// Still frame plus the "z z" mark (SPEC 2b).
+    sleeping: bool = false,
+    bubble_actions: []const Action = &.{},
+    /// Open while non-null (Electron toggles it on click).
+    panel: ?Panel = null,
+    badge: ?Badge = null,
+    /// Null: the second sprite plays the first's animation.
+    second_anim: ?Anim = null,
+
+    pub fn anim(self: Render) Anim {
+        return .{
+            .state = self.state,
+            .row = self.row,
+            .frames = self.frames,
+            .duration_ms = self.duration_ms,
+            .once = self.once,
+            .still = self.still,
+            .play_key = self.play_key,
+        };
+    }
 };
 
 pub const Point = struct { x: f64, y: f64 };
@@ -166,7 +284,7 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8) ParseError!Inbound 
             .object => |o| o,
             else => return error.InvalidLine,
         };
-        return .{ .render = try parseRender(payload) };
+        return .{ .render = try parseRender(arena, payload) };
     }
     if (eql(kind, "menu")) {
         const tray = try parseMenu(arena, obj.get("tray"));
@@ -176,9 +294,9 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8) ParseError!Inbound 
     return error.InvalidLine;
 }
 
-fn parseRender(o: std.json.ObjectMap) ParseError!Render {
+fn parseRender(arena: std.mem.Allocator, o: std.json.ObjectMap) ParseError!Render {
     const state_name = str(o, "state") orelse return error.InvalidLine;
-    const state = std.meta.stringToEnum(sprite.State, state_name) orelse return error.InvalidLine;
+    const state = std.meta.stringToEnum(State, state_name) orelse return error.InvalidLine;
     const row = int(o, "row") orelse return error.InvalidLine;
     const frames = int(o, "frames") orelse return error.InvalidLine;
     const duration = int(o, "durationMs") orelse return error.InvalidLine;
@@ -199,12 +317,141 @@ fn parseRender(o: std.json.ObjectMap) ParseError!Render {
         .duration_ms = @intCast(duration),
         .once = boolean(o, "once") orelse false,
         .still = boolean(o, "still") orelse false,
-        .play_key = clipUtf8(str(o, "playKey") orelse "", 128),
+        .play_key = clipUtf8(str(o, "playKey") orelse "", max_play_key_bytes),
         .bubble = if (bubble) |text| (if (text.len == 0) null else text) else null,
         .size = parseSize(str(o, "size")) orelse .m,
         .atlas = atlas,
         .second = second,
+        .motion = try parseMotion(o.get("motion")),
+        .sleeping = try optionalBool(o, "sleeping"),
+        .bubble_actions = try parseActions(arena, o.get("bubbleActions"), max_bubble_actions),
+        .panel = try parsePanel(arena, o.get("panel")),
+        .badge = try parseBadge(o.get("badge")),
+        .second_anim = try parseAnim(o.get("secondAnim")),
     };
+}
+
+/// null / missing = no motion; an unknown value too (a newer motion).
+pub fn parseMotion(v: ?std.json.Value) ParseError!?Motion {
+    return switch (v orelse return null) {
+        .null => null,
+        .string => |s| std.meta.stringToEnum(Motion, s),
+        else => error.InvalidLine,
+    };
+}
+
+/// Missing = false; a non-boolean rejects.
+pub fn optionalBool(o: std.json.ObjectMap, key: []const u8) ParseError!bool {
+    return switch (o.get(key) orelse return false) {
+        .bool => |b| b,
+        .null => false,
+        else => error.InvalidLine,
+    };
+}
+
+/// `[{ id, label }]` (or null): at most `max` kept, labels clipped.
+pub fn parseActions(arena: std.mem.Allocator, v: ?std.json.Value, max: usize) ParseError![]const Action {
+    const items = switch (v orelse return &.{}) {
+        .null => return &.{},
+        .array => |a| a.items,
+        else => return error.InvalidLine,
+    };
+    var out: std.ArrayList(Action) = .empty;
+    for (items) |raw| {
+        const o = switch (raw) {
+            .object => |o| o,
+            else => return error.InvalidLine,
+        };
+        const id = str(o, "id") orelse return error.InvalidLine;
+        if (!actionIdOk(id)) return error.InvalidLine;
+        const label = str(o, "label") orelse return error.InvalidLine;
+        if (out.items.len >= max) continue;
+        try out.append(arena, .{ .id = id, .label = clipUtf8(label, max_action_label_bytes) });
+    }
+    return out.items;
+}
+
+/// `{ lines: string[], actions: [{ id, label }] }` (or null).
+fn parsePanel(arena: std.mem.Allocator, v: ?std.json.Value) ParseError!?Panel {
+    const o = switch (v orelse return null) {
+        .null => return null,
+        .object => |o| o,
+        else => return error.InvalidLine,
+    };
+    var lines: std.ArrayList([]const u8) = .empty;
+    switch (o.get("lines") orelse std.json.Value.null) {
+        .null => {},
+        .array => |a| for (a.items) |item| {
+            const line = switch (item) {
+                .string => |s| s,
+                else => return error.InvalidLine,
+            };
+            if (line.len == 0 or lines.items.len >= max_panel_lines) continue;
+            try lines.append(arena, clipUtf8(line, max_panel_line_bytes));
+        },
+        else => return error.InvalidLine,
+    }
+    return .{
+        .lines = lines.items,
+        .actions = try parseActions(arena, o.get("actions"), max_panel_actions),
+    };
+}
+
+/// `{ kind: 'answer', label }` (or null); another kind is read as null.
+fn parseBadge(v: ?std.json.Value) ParseError!?Badge {
+    const o = switch (v orelse return null) {
+        .null => return null,
+        .object => |o| o,
+        else => return error.InvalidLine,
+    };
+    const kind = str(o, "kind") orelse return error.InvalidLine;
+    if (!eql(kind, "answer")) return null;
+    const label = str(o, "label") orelse "";
+    return .{ .label = clipUtf8(if (label.len == 0) "Answer ready" else label, max_badge_label_bytes) };
+}
+
+/// `{ state, row, frames, durationMs, once, still, playKey, delayMs? }` or
+/// null. A state this pet does not know reads as null (the second sprite
+/// then mirrors the first); a bad row / frame count rejects like the
+/// payload's own.
+pub fn parseAnim(v: ?std.json.Value) ParseError!?Anim {
+    const o = switch (v orelse return null) {
+        .null => return null,
+        .object => |o| o,
+        else => return error.InvalidLine,
+    };
+    const state_name = str(o, "state") orelse return error.InvalidLine;
+    const row = int(o, "row") orelse return error.InvalidLine;
+    const frames = int(o, "frames") orelse return error.InvalidLine;
+    const duration = int(o, "durationMs") orelse return error.InvalidLine;
+    if (row < 0 or row > 10 or frames < 1 or frames > 8) return error.InvalidLine;
+    if (duration < 0 or duration > 60_000) return error.InvalidLine;
+    const delay: i64 = switch (o.get("delayMs") orelse std.json.Value.null) {
+        .null => 0,
+        else => int(o, "delayMs") orelse return error.InvalidLine,
+    };
+    if (delay < 0) return error.InvalidLine;
+    const state = std.meta.stringToEnum(State, state_name) orelse return null;
+    return .{
+        .state = state,
+        .row = @intCast(row),
+        .frames = @intCast(frames),
+        .duration_ms = @intCast(duration),
+        .once = try optionalBool(o, "once"),
+        .still = try optionalBool(o, "still"),
+        .play_key = clipUtf8(str(o, "playKey") orelse "", max_play_key_bytes),
+        .delay_ms = @intCast(@min(delay, max_delay_ms)),
+    };
+}
+
+/// Action ids: `[a-z0-9-]`, 1–32 bytes.
+pub fn actionIdOk(id: []const u8) bool {
+    if (id.len == 0 or id.len > max_action_id_bytes) return false;
+    for (id) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 fn parseSprite(v: std.json.Value) ParseError!?Sprite {
@@ -338,7 +585,24 @@ pub fn tokenMatches(expected: []const u8, got: []const u8) bool {
 
 // ------------------------------------------------------------- outbound
 
-pub const NativeEvent = enum { drag, dragEnd, click, dblclick, hover, bubbleClick };
+pub const NativeEvent = enum {
+    drag,
+    dragEnd,
+    click,
+    dblclick,
+    hover,
+    bubbleClick,
+    // round 3: sent only while the payload carries what they answer
+    /// A bubble button (`id` = one of the payload's bubbleActions).
+    bubbleAction,
+    /// A panel button (`id` = one of the payload's panel actions), or
+    /// `id` = `panel_close_id` when the pet closed the panel itself.
+    panelAction,
+};
+
+/// panelAction id for "the pet closed the panel" (20 s without the
+/// pointer, Escape): contract.mjs PANEL_CLOSE_ID.
+pub const panel_close_id = "close";
 pub const SecondSide = enum { left, right };
 
 /// Encode an outbound message as one JSON line (with its newline) into
@@ -363,6 +627,7 @@ pub const Event = struct {
     event: NativeEvent,
     dx: ?f64 = null,
     dy: ?f64 = null,
+    id: ?[]const u8 = null,
 };
 
 pub const Position = struct {
@@ -371,6 +636,8 @@ pub const Position = struct {
     y: f64,
     displayId: ?[]const u8 = null,
     secondSide: SecondSide = .left,
+    /// Sent at the end of a walk (motion): save it like a drop.
+    walk: ?bool = null,
 };
 
 pub const MenuAction = struct {
@@ -474,7 +741,7 @@ test "render payload" {
     ;
     const msg = try parseLine(arena.allocator(), line);
     const r = msg.render;
-    try testing.expectEqual(sprite.State.@"running-left", r.state);
+    try testing.expectEqual(State.@"running-left", r.state);
     try testing.expectEqual(@as(u8, 2), r.row);
     try testing.expectEqual(@as(u8, 8), r.frames);
     try testing.expectEqual(@as(u32, 1060), r.duration_ms);
@@ -484,6 +751,96 @@ test "render payload" {
     try testing.expectEqualStrings("/p/b.png", r.second.?.path);
     try testing.expectEqual(@as(f32, 2), r.second.?.scale);
     try testing.expect(std.mem.startsWith(u8, r.bubble.?, "Qualifying"));
+}
+
+test "render: a v1 payload reads every round-3 field as nothing new" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = (try parseLine(arena.allocator(),
+        \\{"kind":"render","payload":{"state":"idle","row":0,"frames":6,"durationMs":1100,"once":false,"still":false,
+        \\"playKey":"idle","bubble":null,"size":"m","atlas":{"path":"/p/a.png","rows":9,"scale":1},"second":null}}
+    )).render;
+    try testing.expect(r.motion == null and !r.sleeping and r.bubble_actions.len == 0);
+    try testing.expect(r.panel == null and r.badge == null and r.second_anim == null);
+    try testing.expectEqual(State.idle, r.anim().state);
+    try testing.expectEqual(@as(u32, 0), r.anim().delay_ms);
+}
+
+test "render: round-3 fields (motion, sleep, bubble buttons, panel, badge, secondAnim, v2 rows)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const line =
+        \\{"kind":"render","payload":{"state":"look-a","row":9,"frames":8,"durationMs":1120,"once":true,"still":false,
+        \\"playKey":"look:1","bubble":"Did you know?","size":"m","atlas":{"path":"/p/a.webp","rows":11,"scale":1},
+        \\"second":{"path":"/p/b.webp","rows":9,"scale":1},"motion":"roam","sleeping":true,
+        \\"bubbleActions":[{"id":"ok","label":"OK"},{"id":"quiet-1h","label":"Quiet 1 h"},{"id":"mute","label":"No daily facts"},{"id":"quiet-session","label":"x"}],
+        \\"panel":{"lines":["Race in 2 h · Abu Dhabi GP","Norris P1","three","four"],"actions":[{"id":"ask","label":"Ask F1"},{"id":"hot-lap","label":"Hot lap"}]},
+        \\"badge":{"kind":"answer","label":"Answer ready"},
+        \\"secondAnim":{"state":"waving","row":3,"frames":4,"durationMs":700,"once":true,"still":false,"playKey":"duo-wave:2","delayMs":700},
+        \\"future":{"x":1}}}
+    ;
+    const r = (try parseLine(arena.allocator(), line)).render;
+    try testing.expectEqual(State.@"look-a", r.state);
+    try testing.expectEqual(@as(u8, 9), r.row);
+    try testing.expectEqual(Motion.roam, r.motion.?);
+    try testing.expect(r.sleeping);
+    // At most three bubble buttons; the fourth is dropped.
+    try testing.expectEqual(@as(usize, 3), r.bubble_actions.len);
+    try testing.expectEqualStrings("mute", r.bubble_actions[2].id);
+    try testing.expectEqualStrings("No daily facts", r.bubble_actions[2].label);
+    // At most three panel lines.
+    try testing.expectEqual(@as(usize, 3), r.panel.?.lines.len);
+    try testing.expectEqualStrings("Norris P1", r.panel.?.lines[1]);
+    try testing.expectEqualStrings("hot-lap", r.panel.?.actions[1].id);
+    try testing.expectEqualStrings("Answer ready", r.badge.?.label);
+    const second = r.second_anim.?;
+    try testing.expectEqual(State.waving, second.state);
+    try testing.expectEqual(@as(u32, 700), second.delay_ms);
+    try testing.expect(second.once);
+    try testing.expectEqualStrings("duo-wave:2", second.play_key);
+}
+
+test "render: unknown round-3 values read as nothing new, wrong types reject" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const head = "{\"kind\":\"render\",\"payload\":{\"state\":\"idle\",\"row\":0,\"frames\":6,\"durationMs\":1100,\"atlas\":{\"path\":\"/a\"},";
+    const lenient = [_][]const u8{
+        "\"motion\":\"fly\"}}",
+        "\"badge\":{\"kind\":\"mail\",\"label\":\"x\"}}}",
+        "\"secondAnim\":{\"state\":\"dance\",\"row\":0,\"frames\":6,\"durationMs\":1}}}",
+        "\"panel\":null,\"bubbleActions\":null,\"secondAnim\":null,\"badge\":null,\"motion\":null}}",
+    };
+    for (lenient) |tail| {
+        const r = (try parseLine(a, try std.mem.concat(a, u8, &.{ head, tail }))).render;
+        try testing.expect(r.motion == null and r.badge == null and r.second_anim == null and r.panel == null);
+    }
+    // Delays are capped; a missing badge label gets the default.
+    const capped = (try parseLine(a, try std.mem.concat(a, u8, &.{ head, "\"secondAnim\":{\"state\":\"idle\",\"row\":0,\"frames\":6,\"durationMs\":1,\"delayMs\":99999},\"badge\":{\"kind\":\"answer\"}}}" }))).render;
+    try testing.expectEqual(max_delay_ms, capped.second_anim.?.delay_ms);
+    try testing.expectEqualStrings("Answer ready", capped.badge.?.label);
+    const strict = [_][]const u8{
+        "\"motion\":1}}",
+        "\"sleeping\":\"yes\"}}",
+        "\"bubbleActions\":{\"id\":\"ok\"}}}",
+        "\"bubbleActions\":[{\"id\":\"OK!\",\"label\":\"OK\"}]}}",
+        "\"bubbleActions\":[{\"id\":\"ok\"}]}}",
+        "\"panel\":{\"lines\":[1],\"actions\":[]}}}",
+        "\"panel\":[]}}",
+        "\"badge\":\"answer\"}}",
+        "\"secondAnim\":{\"state\":\"idle\",\"row\":11,\"frames\":6,\"durationMs\":1}}}",
+        "\"secondAnim\":{\"state\":\"idle\",\"row\":0,\"frames\":6,\"durationMs\":1,\"delayMs\":-1}}}",
+    };
+    for (strict) |tail| {
+        try testing.expectError(error.InvalidLine, parseLine(a, try std.mem.concat(a, u8, &.{ head, tail })));
+    }
+}
+
+test "State extends sprite.State in order" {
+    try testing.expectEqual(State.review, State.fromSprite(.review));
+    try testing.expectEqual(State.@"running-left", State.fromSprite(.@"running-left"));
+    try testing.expect(actionIdOk("quiet-session") and actionIdOk("hot-lap"));
+    try testing.expect(!actionIdOk("") and !actionIdOk("Quiet") and !actionIdOk("a.b") and !actionIdOk("x" ** 33));
 }
 
 test "render rejects bad shapes" {
@@ -579,11 +936,33 @@ test "encode outbound lines" {
     try testing.expectEqualStrings("{\"kind\":\"event\",\"event\":\"click\"}\n", click);
     const pos = encode(&buf, Position{ .x = 40, .y = 60, .secondSide = .right }).?;
     try testing.expectEqualStrings("{\"kind\":\"position\",\"x\":40,\"y\":60,\"secondSide\":\"right\"}\n", pos);
-    const caps = [_][]const u8{"duo"};
-    const ready = encode(&buf, Ready{ .version = "0.1.0", .caps = &caps, .pid = 7 }).?;
+    const duo_caps = [_][]const u8{"duo"};
+    const ready = encode(&buf, Ready{ .version = "0.1.0", .caps = &duo_caps, .pid = 7 }).?;
     try testing.expectEqualStrings("{\"kind\":\"ready\",\"protocol\":1,\"version\":\"0.1.0\",\"caps\":[\"duo\"],\"pid\":7}\n", ready);
     var tiny: [8]u8 = undefined;
     try testing.expect(encode(&tiny, Ack{}) == null);
+    // Round 3: button events carry the id; a walk's end says so.
+    try testing.expectEqualStrings(
+        "{\"kind\":\"event\",\"event\":\"bubbleAction\",\"id\":\"quiet-1h\"}\n",
+        encode(&buf, Event{ .event = .bubbleAction, .id = "quiet-1h" }).?,
+    );
+    try testing.expectEqualStrings(
+        "{\"kind\":\"event\",\"event\":\"panelAction\",\"id\":\"ask\"}\n",
+        encode(&buf, Event{ .event = .panelAction, .id = "ask" }).?,
+    );
+    try testing.expectEqualStrings(
+        "{\"kind\":\"event\",\"event\":\"panelAction\",\"id\":\"close\"}\n",
+        encode(&buf, Event{ .event = .panelAction, .id = panel_close_id }).?,
+    );
+    try testing.expectEqualStrings(
+        "{\"kind\":\"position\",\"x\":10,\"y\":20,\"secondSide\":\"left\",\"walk\":true}\n",
+        encode(&buf, Position{ .x = 10, .y = 20, .walk = true }).?,
+    );
+    var big: [512]u8 = undefined;
+    const all = encode(&big, Ready{ .version = "0.2.0", .caps = &caps, .pid = 7 }).?;
+    for ([_][]const u8{ "\"motion\"", "\"sleep\"", "\"bubble-actions\"", "\"panel\"", "\"badge\"", "\"second-anim\"", "\"v2-rows\"", "\"timeline-v2\"" }) |cap| {
+        try testing.expect(std.mem.indexOf(u8, all, cap) != null);
+    }
 }
 
 test "clipUtf8 keeps whole code points" {

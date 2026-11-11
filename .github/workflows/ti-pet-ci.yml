@@ -57,7 +57,7 @@ jobs:
           set -euo pipefail
           # Every module listed here must exist: a rename must update this
           # list rather than silently drop its tests.
-          for MODULE in protocol timeline state launch countdown; do
+          for MODULE in protocol timeline state launch countdown motion; do
             echo "::group::zig test src/$MODULE.zig"
             # launch.zig spawns real detached processes: libc on Linux.
             if [[ "$MODULE" == launch && "$RUNNER_OS" == "Linux" ]]; then

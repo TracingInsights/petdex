@@ -41,7 +41,7 @@ pub const Moment = struct {
 
 pub const Entry = struct {
     visible: bool = true,
-    state: sprite.State = .idle,
+    state: protocol.State = .idle,
     row: u8 = 0,
     frames: u8 = 6,
     duration_ms: u32 = 1100,
@@ -52,7 +52,16 @@ pub const Entry = struct {
     bubble_target: ?[]const u8 = null,
     duo: bool = false,
     moment: ?Moment = null,
+    // timeline v2
+    motion: ?protocol.Motion = null,
+    sleeping: bool = false,
+    bubble_actions: []const protocol.Action = &.{},
+    bubble_kind: ?[]const u8 = null,
+    second_anim: ?protocol.Anim = null,
 };
+
+pub const Panel = timeline.Panel;
+pub const PanelAction = timeline.PanelAction;
 
 pub const TimelineSprite = struct {
     path: []const u8,
@@ -135,7 +144,30 @@ pub const Timeline = struct {
             .bubble_target = e.bubble_target,
             .duo = e.duo,
             .moment = if (e.moment) |m| .{ .name = @tagName(m.name), .value = m.value } else null,
+            .motion = e.motion,
+            .sleeping = e.sleeping,
+            .bubble_actions = e.bubble_actions,
+            .bubble_kind = e.bubble_kind,
+            .second_anim = e.second_anim,
         } };
+    }
+
+    /// The click panel compiled into the file (v2), or null.
+    pub fn panel(self: *const Timeline) ?Panel {
+        const inner = self.inner orelse return null;
+        return inner.panel;
+    }
+
+    /// The panel's countdown line at `now_ms` (into `buf`), or null.
+    pub fn panelCountdown(self: *const Timeline, buf: []u8, now_ms: i64) ?[]const u8 {
+        const inner = self.inner orelse return null;
+        return inner.panelCountdown(buf, now_ms);
+    }
+
+    /// A calendar `mute` offline: no hover countdown either (as
+    /// sessionReactions 'off' does in the app).
+    pub fn muteSessionReactions(self: *Timeline) void {
+        if (self.inner) |inner| inner.session_reactions = .off;
     }
 
     /// End of the session "Quiet until this session ends" covers: the one
@@ -157,11 +189,17 @@ pub fn hoverText(buf: []u8, tl: *const Timeline, now_ms: i64) ?[]const u8 {
 
 // ----------------------------------------------------------------- state
 
+pub const max_bubble_kind_bytes = timeline.max_bubble_kind_bytes;
+pub const max_mutes = state.max_mutes;
+
 pub const NativeState = struct {
     enabled: ?bool = null,
     size: ?protocol.Size = null,
     /// null = not changed natively, 0 = Quiet switched off.
     quiet_until_ms: ?i64 = null,
+    /// Bubble kinds muted while Electron was gone.
+    mutes: [state.max_mutes]state.Mute = undefined,
+    mutes_len: usize = 0,
 };
 
 /// pet-native-state.json as this pet wrote it while Electron was gone
@@ -169,7 +207,7 @@ pub const NativeState = struct {
 pub fn loadNativeState(user_data: ?[]const u8) ?NativeState {
     const dir = user_data orelse return null;
     const st = state.read(loopIo(), dir);
-    return .{
+    var out: NativeState = .{
         .enabled = st.enabled,
         .size = st.size,
         .quiet_until_ms = switch (st.quiet) {
@@ -178,6 +216,11 @@ pub fn loadNativeState(user_data: ?[]const u8) ?NativeState {
             .until => |ms| ms,
         },
     };
+    for (st.muted()) |m| {
+        out.mutes[out.mutes_len] = m;
+        out.mutes_len += 1;
+    }
+    return out;
 }
 
 fn saveChange(user_data: ?[]const u8, change: state.Change) void {
@@ -206,6 +249,12 @@ pub fn saveEnabled(user_data: ?[]const u8, enabled: bool) void {
 
 pub fn saveSize(user_data: ?[]const u8, size: protocol.Size) void {
     saveChange(user_data, .{ .size = size });
+}
+
+/// A bubble kind switched off with a bubble's `mute` button (Electron turns
+/// it into the matching setting on its next start).
+pub fn saveMute(user_data: ?[]const u8, kind: []const u8) void {
+    saveChange(user_data, .{ .mute = kind });
 }
 
 /// Electron applies it to the OS login item on its next start.

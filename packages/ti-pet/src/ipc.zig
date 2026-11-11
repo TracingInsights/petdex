@@ -15,8 +15,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 
-pub const version = "0.1.1";
-pub const caps = [_][]const u8{ "duo", "bubble", "menu", "timeline" };
+pub const version = "0.2.0";
+/// protocol.caps: what this pet draws (Electron gates payload fields on it).
+pub const caps = protocol.caps;
 
 const SpinMutex = struct {
     inner: std.atomic.Mutex = .unlocked,
