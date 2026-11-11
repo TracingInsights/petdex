@@ -901,6 +901,25 @@ function pointerTo(x, y) {
   xdo(['mousemove', String(Math.round(x)), String(Math.round(y))]);
 }
 
+/**
+ * Move the pointer to the screen corner, off the pets: xdotool on Linux,
+ * PowerShell on Windows (no input tool there, but the cursor can be set).
+ * A pet that walked under a resting pointer keeps a hover that blocks
+ * roaming and keeps the panel open (both by design). macOS: no tool.
+ */
+function parkPointer() {
+  if (canClick()) return pointerTo(2, 2);
+  if (platform !== 'win32') return;
+  const ps =
+    'Add-Type -AssemblyName System.Windows.Forms; ' +
+    '[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(2, 2)';
+  try {
+    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 20_000, stdio: 'ignore' });
+  } catch (error) {
+    warn(`moving the pointer away failed: ${error.message.split('\n')[0]}`);
+  }
+}
+
 async function clickAt(x, y) {
   pointerTo(x, y);
   await sleep(150);
@@ -1494,7 +1513,7 @@ async function roundThreeLive(conn, ready, sheets) {
   if (missing.length > 0) fail(`ready.caps lacks round-3 capabilities: ${missing.join(', ')}`);
   pass(`ready.caps lists round 3 (${ROUND3_CAPS.join(', ')})`);
   // Keep the pointer off the pet: a hover stops walking.
-  if (canClick()) pointerTo(2, 2);
+  parkPointer();
 
   // A v2 look-around row on the 11-row sheet; the 9-row partner plays idle.
   const v2 = { path: sheets.firstV2, rows: 11, scale: 1 };
@@ -1639,8 +1658,10 @@ async function roundThreeLive(conn, ready, sheets) {
       fail('panel: no click on the button row came back as panelAction');
     }
     pass(`panel button click → event panelAction ${action().id}`);
-    pointerTo(2, 2);
   }
+  // The 20 s close counts from the pointer leaving: park it off the pets
+  // (on Windows the pet may have walked under the runner's resting cursor).
+  parkPointer();
   const closed = (m) => m.kind === 'event' && m.event === 'panelAction' && m.id === 'close';
   const closeMs = await conn.waitFor(() => conn.received.some(closed), 24_000);
   if (closeMs === null) fail('panel: no panelAction close within 24 s of the pointer leaving');
