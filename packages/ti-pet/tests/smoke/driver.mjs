@@ -495,26 +495,47 @@ function rowOf(img, kind) {
   return Math.round((xo - (MARGIN + NOTCH_X0 + NOTCH_W / 2)) / NOTCH_STEP);
 }
 
-/** Red badge-dot pixels (main.zig withMarks: rgb 239, 68, 68). */
-function badgePixels(img) {
-  const { data, channels } = img;
+/**
+ * The pets' area of a shot: their dense box plus a margin (the badge and the
+ * "z z" sit on the sprites), else the whole shot. Full-screen captures also
+ * hold the desktop — a red tray / Dock badge or a blue wallpaper must not
+ * count as the pet's marks.
+ */
+function petsArea(img, box) {
+  if (!box) return { x0: 0, y0: 0, x1: img.width - 1, y1: img.height - 1 };
+  const pad = Math.round((box.maxX - box.minX + 1) * 0.1);
+  return {
+    x0: Math.max(0, box.minX - pad),
+    y0: Math.max(0, box.minY - pad),
+    x1: Math.min(img.width - 1, box.maxX + pad),
+    y1: Math.min(img.height - 1, box.maxY + pad)
+  };
+}
+
+/** Pixels inside `area` for which `test(r, g, b)` holds. */
+function countIn(img, area, test) {
+  const { data, channels, width } = img;
   let n = 0;
-  for (let i = 0; i + 2 < data.length; i += channels) {
-    if (data[i] > 200 && data[i + 1] < 110 && data[i + 2] < 110) n += 1;
+  for (let y = area.y0; y <= area.y1; y += 1) {
+    for (let x = area.x0; x <= area.x1; x += 1) {
+      const i = (y * width + x) * channels;
+      if (test(data[i], data[i + 1], data[i + 2])) n += 1;
+    }
   }
   return n;
 }
 
+/** Red badge-dot pixels (main.zig withMarks: rgb 239, 68, 68). */
+function badgePixels(img, area) {
+  return countIn(img, area, (r, g, b) => r > 200 && g < 110 && b < 110);
+}
+
 /** Blue-grey "z z" pixels (main.zig withMarks, dark or light), cyan excluded. */
-function zzPixels(img) {
-  const { data, channels } = img;
-  let n = 0;
-  for (let i = 0; i + 2 < data.length; i += channels) {
-    const [r, g, b] = [data[i], data[i + 1], data[i + 2]];
-    if (g > 190 && r < 80) continue;
-    if (r >= 60 && g >= 60 && b - r >= 20 && b - g >= 10 && b <= 245) n += 1;
-  }
-  return n;
+function zzPixels(img, area) {
+  return countIn(img, area, (r, g, b) => {
+    if (g > 190 && r < 80) return false;
+    return r >= 60 && g >= 60 && b - r >= 20 && b - g >= 10 && b <= 245;
+  });
 }
 
 /** Both shots show the same pixels inside `box` (a still frame). */
@@ -665,8 +686,13 @@ const groupSpan = (duo) =>
 /** Bubble centre may sit this far (points) from the pets' centre. */
 const BUBBLE_CENTRE_TOLERANCE = 40;
 
-/** Pixel problems of one shot: [] = as expected. */
-function shotProblems(img, expect, before) {
+/**
+ * Pixel problems of one shot: [] = as expected. `ref` = an earlier shot of
+ * the same scene without the marks: the badge / "z z" counts are taken
+ * relative to it, so a desktop behind or between the pets (Windows console
+ * text, a blue wallpaper) cancels out.
+ */
+function shotProblems(img, expect, before, ref = null) {
   const pets = petPixels(img);
   const problems = [];
   if (expect.first === true && pets.first < MIN_PET_PX) problems.push('first pet not visible');
@@ -681,10 +707,14 @@ function shotProblems(img, expect, before) {
     const ok = Array.isArray(want) ? want.includes(got) : got === want;
     if (!ok) problems.push(`${who} pet shows row ${got}, want ${JSON.stringify(want)}`);
   }
-  if (expect.badge === true && badgePixels(img) < 30) problems.push(`no badge dot (${badgePixels(img)} red px)`);
-  if (expect.badge === false && badgePixels(img) >= 10) problems.push('badge dot while none is set');
-  if (expect.zz === true && zzPixels(img) < 12) problems.push(`no "z z" mark (${zzPixels(img)} px)`);
-  if (expect.zz === false && zzPixels(img) >= 12) problems.push('"z z" mark while awake');
+  const area = petsArea(img, pets.box);
+  const sameSize = ref && ref.width === img.width && ref.height === img.height;
+  const red = badgePixels(img, area) - (sameSize ? badgePixels(ref, area) : 0);
+  const zz = zzPixels(img, area) - (sameSize ? zzPixels(ref, area) : 0);
+  if (expect.badge === true && red < 30) problems.push(`no badge dot (${red} red px)`);
+  if (expect.badge === false && red >= 10) problems.push(`badge dot while none is set (${red} red px)`);
+  if (expect.zz === true && zz < 12) problems.push(`no "z z" mark (${zz} px)`);
+  if (expect.zz === false && zz >= 12) problems.push(`"z z" mark while awake (${zz} px)`);
   const result = { pets, bubble: null, problems, bubbleProblems: [] };
   if (!expect.bubble || problems.length > 0 || !pets.box) return result;
   const bubble = bubbleBox(img, before);
@@ -719,7 +749,7 @@ function shotProblems(img, expect, before) {
 let petPid = null;
 const shots = [];
 const images = new Map();
-async function capture(name, expect, { before = null } = {}) {
+async function capture(name, expect, { before = null, ref = null } = {}) {
   const file = join(opts.artifacts, `${String(shots.length + 1).padStart(2, '0')}-${name}.png`);
   let img = null;
   let result = null;
@@ -727,7 +757,7 @@ async function capture(name, expect, { before = null } = {}) {
     await sleep(attempt === 1 ? 1200 : 1000); // poll tick (100 ms) + a few frames + compositor
     img = takeShot(name, file);
     if (!img) break;
-    result = shotProblems(img, expect, before ? images.get(before) : null);
+    result = shotProblems(img, expect, before ? images.get(before) : null, ref ? (images.get(ref) ?? null) : null);
     if (result.problems.length === 0 && result.bubbleProblems.length === 0) break;
     info(`${name}: attempt ${attempt}: ${[...result.problems, ...result.bubbleProblems].join(', ')}; retrying`);
   }
@@ -783,8 +813,12 @@ function petXWindows() {
   return { main: wins[0] ?? null, float: wins[1] ?? null };
 }
 
+/**
+ * No `--sync`: it waits for a pointer motion event, and a move to where the
+ * pointer already is sends none, so it hangs until the timeout (Xvfb).
+ */
 function pointerTo(x, y) {
-  xdo(['mousemove', '--sync', String(Math.round(x)), String(Math.round(y))]);
+  xdo(['mousemove', String(Math.round(x)), String(Math.round(y))]);
 }
 
 async function clickAt(x, y) {
@@ -1383,14 +1417,14 @@ async function roundThreeLive(conn, ready, sheets) {
 
   // Asleep: a still frame and the "z z" mark.
   conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, still: true, extra: { sleeping: true } }) });
-  await capture('sleeping', { first: true, second: true, zz: true, badge: false });
+  await capture('sleeping', { first: true, second: true, zz: true, badge: false }, { ref: 'second-anim' });
   await stillCheck('sleeping');
   conn.check('sleeping');
   pass('sleeping accepted');
 
   // The answer-ready badge (the pet is awake again: no "z z").
   conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, extra: { badge: { kind: 'answer', label: 'Answer ready' } } }) });
-  await capture('badge', { first: true, second: true, badge: true, zz: false });
+  await capture('badge', { first: true, second: true, badge: true, zz: false }, { ref: 'second-anim' });
   conn.check('badge');
   pass('badge accepted');
 

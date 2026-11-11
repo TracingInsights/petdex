@@ -3,3 +3,6 @@
 # from `git diff --check` (app-ci's whitespace gate) instead of altering them.
 *.patch -whitespace
 src/sprite.zig -whitespace
+
+# Fixtures are searched as text by the Zig tests: keep LF on Windows checkouts.
+tests/fixtures/*.json text eol=lf
