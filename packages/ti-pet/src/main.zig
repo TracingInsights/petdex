@@ -32,6 +32,7 @@ const protocol = @import("protocol.zig");
 const ipc = if (builtin.os.tag == .windows) @import("pipe_windows.zig") else @import("ipc.zig");
 const core = @import("core.zig");
 const motion = @import("motion.zig");
+const colorkey = @import("colorkey.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -111,6 +112,13 @@ const Args = struct {
     size: protocol.Size = .m,
 };
 var args: Args = .{};
+/// `TI_PET_DEBUG=1`: walking, motion gates and frame ticks to stderr (the
+/// smoke sets it; Electron starts the pet with stdio ignored).
+var debug = false;
+
+fn dlog(comptime fmt: []const u8, fmt_args: anytype) void {
+    if (debug) std.debug.print("ti-pet: " ++ fmt ++ "\n", fmt_args);
+}
 var gpa: std.mem.Allocator = std.heap.page_allocator;
 var server: ?*ipc.Server = null;
 var launch_env: ?std.process.Environ.Map = null;
@@ -457,6 +465,12 @@ pub const Model = struct {
     pet_menu: Menu = .{},
     dark: bool = true,
     reduce_motion: bool = false,
+    appearance_seen: bool = false,
+    // --- diagnostics (TI_PET_DEBUG) ---
+    /// The motion gate last logged.
+    last_gate: []const u8 = "",
+    frame_ticks: u32 = 0,
+    ticks_logged_ms: i64 = 0,
     poll_ms: u32 = 0,
 };
 
@@ -569,6 +583,8 @@ fn registerRow(fx: *Effects, path: []const u8, rows_hint: u8, row: u8, frames: u
             const src_off = ((src_y + y) * decoded.width + src_x) * 4;
             @memcpy(scratch[y * fw * 4 ..][0 .. fw * 4], pixels[src_off..][0 .. fw * 4]);
         }
+        // Windows keys transparent windows on pure black: keep black art.
+        if (colorkey.needed) _ = colorkey.liftKeyedBlack(scratch);
         fx.registerImage(base + i, fw, fh, scratch) catch return null;
     }
     return @intCast(rows);
@@ -644,15 +660,15 @@ fn applyTracks(model: *Model, fx: *Effects) void {
         second = null;
     }
     first = fitRows(first, model.want_first_rows, "fallback");
-    const restart1 = model.anim.take(first, model.reduce_motion);
+    const restart1 = model.anim.take(first, osStill(model));
     var mirrors = true;
     var restart2 = false;
     if (second) |s| {
         mirrors = false;
-        restart2 = model.anim2.take(fitRows(s, model.want_second_rows, "fallback:second"), model.reduce_motion);
+        restart2 = model.anim2.take(fitRows(s, model.want_second_rows, "fallback:second"), osStill(model));
     } else if (first.row >= model.want_second_rows) {
         mirrors = false;
-        restart2 = model.anim2.take(fitRows(first, model.want_second_rows, "fallback:second"), model.reduce_motion);
+        restart2 = model.anim2.take(fitRows(first, model.want_second_rows, "fallback:second"), osStill(model));
     }
     if (mirrors != model.second_mirrors) restart2 = true;
     model.second_mirrors = mirrors;
@@ -873,6 +889,7 @@ fn walkMove(p: *anyopaque, x: f64) ?motion.Landed {
     c.model.pet_x = r.x;
     c.model.pet_y = r.y;
     c.model.have_position = true;
+    if (r.hit_x) dlog("walk: the clamp stopped the window at x {d:.0} (asked {d:.0})", .{ r.x, x });
     return .{ .x = r.x, .hit = r.hit_x };
 }
 
@@ -883,12 +900,14 @@ fn walkSave(p: *anyopaque, window_x: f64) void {
     if (!c.model.have_position) return;
     c.model.pet_x = window_x;
     const x = window_x + firstOffset(c.model);
+    dlog("walk: saved x {d:.0} y {d:.0}", .{ x, c.model.pet_y });
     if (c.model.connected and c.model.driven) {
         send(protocol.Position{ .x = x, .y = c.model.pet_y, .secondSide = .left, .walk = true });
     } else core.savePosition(args.user_data, x, c.model.pet_y);
 }
 
 fn walkArm(p: *anyopaque, ms: u32) void {
+    if (ms != motion.motion_tick_ms) dlog("walk: next step in {d} ms", .{ms});
     walkCtx(p).fx.startTimer(.{ .key = walk_timer_key, .interval_ms = ms, .mode = .one_shot, .on_fire = Effects.timerMsg(.walk_tick) });
 }
 
@@ -901,6 +920,8 @@ const WalkOp = union(enum) { tick, interrupt, stop, set: ?protocol.Motion };
 /// One walker call; the pose it leaves (running or not) goes on screen.
 fn walk(model: *Model, fx: *Effects, op: WalkOp) void {
     const before = model.walker.pose();
+    const before_phase = model.walker.phase;
+    const before_to: ?f64 = if (model.walker.leg) |leg| leg.to_x else null;
     var ctx: WalkCtx = .{ .model = model, .fx = fx };
     const env: motion.Env = .{
         .ctx = &ctx,
@@ -922,22 +943,72 @@ fn walk(model: *Model, fx: *Effects, op: WalkOp) void {
             model.walker.setMotion(env, m);
         },
     }
+    if (debug) logWalker(model, before_phase, before_to);
     if (!std.meta.eql(before, model.walker.pose())) applyTracks(model, fx);
 }
 
-/// The driver's motion minus what the pet sees itself: hidden, dragged,
-/// hovered, panel open, reduce motion, asleep, just touched; offline also
-/// quiet, a local reaction or bubble (the timeline's own gates are
-/// compiled in). A dash runs once per moment.
-fn effectiveMotion(model: *const Model, now: i64) ?protocol.Motion {
-    const want = model.motion_want orelse return null;
-    if (!onScreen(model) or !model.first.ok or model.dragging or model.reduce_motion or model.sleeping) return null;
-    if (want == .dash) return if (model.dash_spent and model.walker.mode != .dash) null else .dash;
-    if (model.hover_inside or model.panel_open or now < model.roam_block_until_ms) return null;
-    if (!model.driven) {
-        if (now < model.quiet_until_ms or model.local_state != null or model.bubble_len > 0) return null;
+/// TI_PET_DEBUG: one line per walker phase change or new leg.
+fn logWalker(model: *const Model, before_phase: motion.Phase, before_to: ?f64) void {
+    const w = &model.walker;
+    const to: ?f64 = if (w.leg) |leg| leg.to_x else null;
+    if (w.phase == before_phase and std.meta.eql(to, before_to)) return;
+    if (w.leg) |leg| {
+        dlog("walk: {t} -> {t} mode={s} leg x {d:.0} -> {d:.0} in {d} ms at {d:.0} px/s edges {?d:.0}..{?d:.0}", .{
+            before_phase, w.phase, if (w.mode) |m| @tagName(m) else "none", leg.from_x, leg.to_x, leg.duration_ms, w.speed, w.left_edge, w.right_edge,
+        });
+    } else {
+        dlog("walk: {t} -> {t} mode={s} edges {?d:.0}..{?d:.0}", .{
+            before_phase, w.phase, if (w.mode) |m| @tagName(m) else "none", w.left_edge, w.right_edge,
+        });
     }
-    return .roam;
+}
+
+/// The OS "reduce motion" setting stills the pet only while nothing drives
+/// it. A driver already applies it: Electron reads the same setting
+/// (`systemPreferences.getAnimationSettings`) into each payload's `still`
+/// and `motion`, and the timeline was compiled with it. Applying it again
+/// on top contradicted the driver (a macOS CI runner reporting reduce
+/// motion froze every frame and blocked every walk, 2026-11-11).
+fn osStill(model: *const Model) bool {
+    return model.reduce_motion and !model.driven;
+}
+
+const MotionGate = struct { motion: ?protocol.Motion, why: []const u8 };
+
+/// The driver's motion minus what the pet sees itself: hidden, dragged,
+/// hovered, panel open, reduce motion (offline), asleep, just touched;
+/// offline also quiet, a local reaction or bubble (the timeline's own
+/// gates are compiled in). A dash runs once per moment. `why` names the
+/// gate that held it (diagnostics).
+fn motionGate(model: *const Model, now: i64) MotionGate {
+    const want = model.motion_want orelse return .{ .motion = null, .why = "no motion wanted" };
+    const held = struct {
+        fn by(why: []const u8) MotionGate {
+            return .{ .motion = null, .why = why };
+        }
+    }.by;
+    if (!onScreen(model)) return held("hidden");
+    if (!model.first.ok) return held("no sprite drawn");
+    if (model.dragging) return held("dragging");
+    if (osStill(model)) return held("reduce motion (OS, no driver)");
+    if (model.sleeping) return held("asleep");
+    if (want == .dash) {
+        if (model.dash_spent and model.walker.mode != .dash) return held("dash already ran");
+        return .{ .motion = .dash, .why = "dash" };
+    }
+    if (model.hover_inside) return held("pointer over the pet");
+    if (model.panel_open) return held("panel open");
+    if (now < model.roam_block_until_ms) return held("touched in the last 30 s");
+    if (!model.driven) {
+        if (now < model.quiet_until_ms) return held("quiet");
+        if (model.local_state != null) return held("local reaction");
+        if (model.bubble_len > 0) return held("bubble showing");
+    }
+    return .{ .motion = .roam, .why = "roam" };
+}
+
+fn effectiveMotion(model: *const Model, now: i64) ?protocol.Motion {
+    return motionGate(model, now).motion;
 }
 
 /// The driver's motion; leaving 'dash' ends the dash episode.
@@ -947,7 +1018,16 @@ fn setMotionWant(model: *Model, m: ?protocol.Motion) void {
 }
 
 fn updateMotion(model: *Model, fx: *Effects) void {
-    walk(model, fx, .{ .set = effectiveMotion(model, fx.wallMs()) });
+    const gate = motionGate(model, fx.wallMs());
+    if (debug and !std.mem.eql(u8, gate.why, model.last_gate)) {
+        model.last_gate = gate.why;
+        dlog("motion: wanted {s} -> {s} ({s})", .{
+            if (model.motion_want) |m| @tagName(m) else "none",
+            if (gate.motion) |m| @tagName(m) else "none",
+            gate.why,
+        });
+    }
+    walk(model, fx, .{ .set = gate.motion });
 }
 
 /// A hover, click or drag: stop walking now and roam no sooner than
@@ -1392,6 +1472,7 @@ fn quitPet() void {
 
 pub fn boot(model: *Model, fx: *Effects) void {
     model.size = args.size;
+    model.ticks_logged_ms = fx.wallMs();
     model.rng = .init(@bitCast(fx.wallMs()));
     defaultMenus(model);
     if (args.pet_dir) |dir| {
@@ -1431,6 +1512,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .frame_tick => |timer| {
             if (timer.outcome != .fired) return;
             model.timer1_on = false;
+            model.frame_ticks +%= 1;
             if (!model.anim.advance()) return;
             armFrameTimer(model, fx);
         },
@@ -1456,8 +1538,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .frame_clock => frameClock(model, fx),
         .appearance => |a| {
-            model.dark = a.color_scheme == .dark;
+            const dark = a.color_scheme == .dark;
+            if (dark == model.dark and a.reduce_motion == model.reduce_motion and model.appearance_seen) return;
+            model.appearance_seen = true;
+            model.dark = dark;
             model.reduce_motion = a.reduce_motion;
+            // Always logged (rare): the first thing to check when the pet
+            // stands still on a machine.
+            std.debug.print("ti-pet: appearance dark={} reduce_motion={}\n", .{ dark, a.reduce_motion });
+            // Offline the OS setting stills the pet (osStill): re-apply.
+            if (!model.driven) {
+                refreshAnim(model, fx);
+                updateMotion(model, fx);
+            }
         },
         .native_drag_started => |dir| dragStarted(model, dir, fx),
         .native_drag_ended => dragEnded(model, fx),
@@ -1501,6 +1594,16 @@ fn poll(model: *Model, fx: *Effects) void {
     defer setPollRate(model, fx);
     const now = fx.wallMs();
     core.reap();
+    if (debug and now - model.ticks_logged_ms >= 10_000) {
+        // Zero ticks while it should animate = frozen frames.
+        dlog("frames: {d} ticks in {d} s; {t} row {d} x{d} still={} timer={} driven={} reduce_motion={}", .{
+            model.frame_ticks, @divTrunc(now - model.ticks_logged_ms, 1000), model.anim.state,
+            model.anim.row,    model.anim.frames,                            model.anim.still,
+            model.timer1_on,   model.driven,                                 model.reduce_motion,
+        });
+        model.frame_ticks = 0;
+        model.ticks_logged_ms = now;
+    }
     if (server) |s| {
         var lines: [64][]u8 = undefined;
         var n: usize = 0;
@@ -2144,6 +2247,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 
 pub fn main(init: std.process.Init) !void {
     try parseArgs(init);
+    if (init.environ_map.get("TI_PET_DEBUG")) |v| debug = std.mem.eql(u8, v, "1");
     args.size = initialSize();
     // Electron must not inherit our GDK_BACKEND=x11 (its own windows stay
     // native Wayland).

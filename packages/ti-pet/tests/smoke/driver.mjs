@@ -469,31 +469,62 @@ function colourBox(img, kind) {
 const black = (data, i) => data[i] < 60 && data[i + 1] < 60 && data[i + 2] < 60;
 
 /**
- * The atlas row a pet's sprite shows, read off its notch (syntheticAtlas),
- * or null when no notch is found.
+ * The notch of a pet's sprite (syntheticAtlas): its x run on the notch's
+ * middle line, with the sprite box and scale, or null.
  */
-function rowOf(img, kind) {
+function notchRun(img, kind) {
   const box = colourBox(img, kind);
   if (!box) return null;
   const s = (box.maxX - box.minX + 1) / (CELL_W - 2 * MARGIN);
   const y = Math.round(box.minY + ((NOTCH_Y0 + NOTCH_Y1) / 2 - MARGIN) * s);
   if (y < 0 || y >= img.height) return null;
-  let best = null;
   let start = null;
   for (let x = box.minX; x <= box.maxX + 1; x += 1) {
     const dark = x <= box.maxX && black(img.data, (y * img.width + x) * img.channels);
     if (dark && start === null) start = x;
     if (!dark && start !== null) {
       const w = x - start;
-      if (w >= NOTCH_W * s * 0.5 && w <= NOTCH_W * s * 2 && !best) best = { from: start, to: x - 1 };
+      if (w >= NOTCH_W * s * 0.5 && w <= NOTCH_W * s * 2) return { box, s, y, from: start, to: x - 1 };
       start = null;
     }
   }
-  if (!best) return null;
-  const mid = (best.from + best.to) / 2;
-  const xo = (mid - box.minX) / s + MARGIN;
+  return null;
+}
+
+/**
+ * The atlas row a pet's sprite shows, read off its notch (syntheticAtlas),
+ * or null when no notch is found.
+ */
+function rowOf(img, kind) {
+  const run = notchRun(img, kind);
+  if (!run) return null;
+  const mid = (run.from + run.to) / 2;
+  const xo = (mid - run.box.minX) / run.s + MARGIN;
   return Math.round((xo - (MARGIN + NOTCH_X0 + NOTCH_W / 2)) / NOTCH_STEP);
 }
+
+/**
+ * The brightest channel inside the notch (1 px in from its edges), or null.
+ * The notch is pure black art: it must read ~black. On Windows a pure-black
+ * pixel used to be keyed away (the Native SDK colour-keys transparent
+ * windows on RGB 0,0,0) and showed what is behind the pet instead — the
+ * CI console's (12,12,12) and its text. ti-pet lifts it to (0,0,1).
+ */
+function notchMax(img, kind) {
+  const run = notchRun(img, kind);
+  if (!run) return null;
+  const half = Math.max(1, Math.floor(((NOTCH_Y1 - NOTCH_Y0) * run.s) / 2) - 1);
+  let max = 0;
+  for (let y = run.y - half; y <= run.y + half; y += 1) {
+    for (let x = run.from + 1; x <= run.to - 1; x += 1) {
+      const i = (y * img.width + x) * img.channels;
+      max = Math.max(max, img.data[i], img.data[i + 1], img.data[i + 2]);
+    }
+  }
+  return max;
+}
+/** A notch brighter than this is not the pet's black (see notchMax). */
+const NOTCH_MAX_CHANNEL = 4;
 
 /**
  * The pets' area of a shot: their dense box plus a margin (the badge and the
@@ -706,6 +737,10 @@ function shotProblems(img, expect, before, ref = null) {
     const got = rowOf(img, kind);
     const ok = Array.isArray(want) ? want.includes(got) : got === want;
     if (!ok) problems.push(`${who} pet shows row ${got}, want ${JSON.stringify(want)}`);
+    const max = notchMax(img, kind);
+    if (ok && max !== null && max > NOTCH_MAX_CHANNEL) {
+      problems.push(`${who} pet's black notch shows what is behind it (brightest channel ${max}): black art keyed away`);
+    }
   }
   const area = petsArea(img, pets.box);
   const sameSize = ref && ref.width === img.width && ref.height === img.height;
@@ -787,6 +822,41 @@ async function stillCheck(name) {
   if (opts.strictPixels) fail(text);
   warn(text);
 }
+
+/**
+ * A few more shots of `name`'s scene: an animating pet must change (its
+ * frame bar moves). All the same = frozen frames (reduce motion forced on
+ * by the pet, or its frame timer never fires — ti-pet.log's "appearance"
+ * and "frames:" lines tell which).
+ */
+async function animatesCheck(name) {
+  const first = images.get(name);
+  if (!first) return;
+  const box = petPixels(first).box;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    await sleep(350);
+    const again = takeShot(name, join(opts.artifacts, `${String(shots.length).padStart(2, '0')}-${name}-anim${attempt}.png`));
+    if (!again) return;
+    if (!sameInBox(first, again, box)) return pass(`${name}: the pets animate`);
+  }
+  const text = `${name}: the pets never changed in 5 shots: frozen frames (${petLogTail(/appearance|frames:/, 2).join(' | ') || 'no ti-pet.log lines'})`;
+  if (opts.strictPixels) fail(text);
+  warn(text);
+}
+
+// --------------------------------------------------------- ti-pet.log
+
+/** ti-pet's stderr (spawnPet; TI_PET_DEBUG=1 adds motion / walk / frames lines). */
+let petLogFile = null;
+function petLogLines() {
+  try {
+    return readFileSync(petLogFile, 'utf8').split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+/** The last `n` ti-pet.log lines matching `re`. */
+const petLogTail = (re, n = 3) => petLogLines().filter((l) => re.test(l)).slice(-n);
 
 // ------------------------------------------------------- pointer (Linux)
 
@@ -1035,6 +1105,8 @@ function spawnPet(binary, { userDataDir, socketPath, tokenPath, appStub, appLog,
   ];
   const env = { ...process.env };
   if (platform === 'linux') env.GDK_BACKEND = 'x11';
+  // Walking, motion gates and frame ticks in ti-pet.log (main.zig dlog).
+  env.TI_PET_DEBUG = '1';
   const fd = openSync(logFile, 'a');
   const child = spawn(binary, args, { detached: true, stdio: ['ignore', fd, fd], env, windowsHide: true });
   const exit = new Promise((done) => {
@@ -1222,13 +1294,15 @@ async function smoke(cleanup) {
   rmSync(appLog, { force: true });
   writeToken(tokenPath);
 
+  petLogFile = join(opts.artifacts, 'ti-pet.log');
+  rmSync(petLogFile, { force: true });
   const pet = spawnPet(opts.binary, {
     userDataDir,
     socketPath,
     tokenPath,
     appStub,
     appLog,
-    logFile: join(opts.artifacts, 'ti-pet.log')
+    logFile: petLogFile
   });
   cleanup.push(() => {
     if (pet.child.exitCode === null && pet.child.signalCode === null) {
@@ -1263,6 +1337,14 @@ async function smoke(cleanup) {
     fail(`ready.pid ${ready.pid} is not the spawned pid ${pet.child.pid} (the desktop refuses such a pipe on Windows)`);
   }
   pass(`hello → ready (version ${ready.version}, caps ${ready.caps.join(',')}, pid ${ready.pid})`);
+  // What the pet reads from the OS (reduce motion stills it while undriven).
+  const appearanceDeadline = Date.now() + 3000;
+  while (Date.now() < appearanceDeadline && petLogTail(/appearance/).length === 0) await sleep(100);
+  info(`ti-pet.log: ${petLogTail(/appearance/, 1)[0] ?? 'no appearance line yet'}`);
+  if (platform === 'darwin') {
+    const reduce = spawnSync('defaults', ['read', 'com.apple.universalaccess', 'reduceMotion'], { encoding: 'utf8', timeout: 10_000 });
+    info(`macOS reduceMotion setting: ${(reduce.stdout || reduce.stderr || '').trim() || 'unreadable'}`);
+  }
   if (platform !== 'win32') pass('socket is ours with mode 0600');
 
   // --- menu, show, renders
@@ -1283,6 +1365,7 @@ async function smoke(cleanup) {
 
   conn.send({ kind: 'render', payload: renderPayload(sheets, { duo: true, state: 'waving', row: 3, frames: 4, durationMs: 700, playKey: 'wave' }) });
   await capture('render-duo', { first: true, second: true });
+  await animatesCheck('render-duo');
   conn.check('render duo');
   pass('render duo accepted');
 
@@ -1454,6 +1537,14 @@ async function roundThreeLive(conn, ready, sheets) {
   } else {
     await sleep(9000);
   }
+  // Every platform: the pet's walker log (TI_PET_DEBUG) shows the run.
+  const dashLines = petLogTail(/walk: .*mode=dash|motion: wanted dash/, 20);
+  const ran = dashLines.some((l) => /walk: idle -> walk mode=dash/.test(l));
+  const done = dashLines.some((l) => /walk: walk -> done mode=dash/.test(l));
+  if (!ran || !done) {
+    fail(`dash: the pet's walker never ${ran ? 'finished' : 'started'} the run (${petLogTail(/motion:|walk:|appearance/, 4).join(' | ') || 'no ti-pet.log lines'})`);
+  }
+  pass('dash: ti-pet.log shows the run start and end');
   conn.check('dash');
 
   // A roam walk: a pause (10–40 s), a walk, then `position` with walk: true.
@@ -1476,7 +1567,11 @@ async function roundThreeLive(conn, ready, sheets) {
     }
   }
   const walk = walked();
-  if (!walk) fail(`roam: no walk ended within ${Math.round((roamDeadline - t1) / 1000)} s (no position with walk: true)`);
+  if (!walk) {
+    fail(
+      `roam: no walk ended within ${Math.round((roamDeadline - t1) / 1000)} s (no position with walk: true; ti-pet.log: ${petLogTail(/motion:|walk:|appearance/, 5).join(' | ') || 'nothing'})`
+    );
+  }
   pass(`roam: walked, then position walk: true (x ${walk.x}) after ${((Date.now() - t1) / 1000).toFixed(1)} s`);
   if (walkingRow !== null && walkingRow !== -1) {
     if (walkingRow === 1 || walkingRow === 2) pass(`roam: running row ${walkingRow} while walking`);
