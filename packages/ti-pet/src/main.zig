@@ -470,6 +470,10 @@ pub const Model = struct {
     /// The motion gate last logged.
     last_gate: []const u8 = "",
     frame_ticks: u32 = 0,
+    /// Win/mac: gpu frame events seen (onFrame). Ticks with no frame
+    /// events = the host never presents; both counting but a frozen
+    /// screen = the present never reaches it (see the SDK's "sdk:" lines).
+    frame_events: u32 = 0,
     ticks_logged_ms: i64 = 0,
     poll_ms: u32 = 0,
 };
@@ -1536,7 +1540,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (timer.outcome != .fired) return;
             dragEnded(model, fx);
         },
-        .frame_clock => frameClock(model, fx),
+        .frame_clock => {
+            model.frame_events +%= 1;
+            frameClock(model, fx);
+        },
         .appearance => |a| {
             const dark = a.color_scheme == .dark;
             if (dark == model.dark and a.reduce_motion == model.reduce_motion and model.appearance_seen) return;
@@ -1596,12 +1603,14 @@ fn poll(model: *Model, fx: *Effects) void {
     core.reap();
     if (debug and now - model.ticks_logged_ms >= 10_000) {
         // Zero ticks while it should animate = frozen frames.
-        dlog("frames: {d} ticks in {d} s; {t} row {d} x{d} still={} timer={} driven={} reduce_motion={}", .{
-            model.frame_ticks, @divTrunc(now - model.ticks_logged_ms, 1000), model.anim.state,
-            model.anim.row,    model.anim.frames,                            model.anim.still,
-            model.timer1_on,   model.driven,                                 model.reduce_motion,
+        dlog("frames: {d} ticks, {d} frame events in {d} s; {t} row {d} x{d} still={} timer={} driven={} reduce_motion={}", .{
+            model.frame_ticks,   model.frame_events, @divTrunc(now - model.ticks_logged_ms, 1000),
+            model.anim.state,    model.anim.row,     model.anim.frames,
+            model.anim.still,    model.timer1_on,    model.driven,
+            model.reduce_motion,
         });
         model.frame_ticks = 0;
+        model.frame_events = 0;
         model.ticks_logged_ms = now;
     }
     if (server) |s| {

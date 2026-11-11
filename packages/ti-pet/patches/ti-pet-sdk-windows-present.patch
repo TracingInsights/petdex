@@ -1,0 +1,351 @@
+diff --git a/src/platform/windows/webview2_host.cpp b/src/platform/windows/webview2_host.cpp
+--- a/src/platform/windows/webview2_host.cpp
++++ b/src/platform/windows/webview2_host.cpp
+@@ -14,6 +14,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
++#include <stdarg.h>
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -336,6 +337,10 @@
+     bool floating = false;
+     bool transparent = false;
+     bool click_through = false;
++    /* ti-pet patch: this transparent window presents per-pixel alpha
++     * through UpdateLayeredWindow (presentTransparentWindow); false = it
++     * fell back to the colour key. */
++    bool alpha_layered = false;
+     /* Declared content min-size floor for user resizes; axes <= 0 keep
+      * the natural minimum (WM_GETMINMAXINFO applies the floor). */
+     double min_width = 0;
+@@ -434,6 +439,14 @@
+     bool gpu_prompt_frame_pending = false;
+     uint64_t gpu_last_emit_ns = 0;
+     uint64_t gpu_frame_index = 0;
++    /* ti-pet patch: present-path counters, logged every 10 s under
++     * TI_PET_DEBUG=1 (tiPetSurfaceStats). */
++    uint32_t tp_emits = 0;
++    uint32_t tp_presents = 0;
++    uint32_t tp_layered_ok = 0;
++    uint32_t tp_layered_failed = 0;
++    uint32_t tp_paints = 0;
++    ULONGLONG tp_logged_ms = 0;
+     double gpu_emitted_width = 0;
+     double gpu_emitted_height = 0;
+     double gpu_emitted_scale = 0;
+@@ -2787,6 +2800,54 @@
+ /* The single frame-event emission: view state (nonblank verdict, sample
+  * color, buffer geometry) is the payload, so one event serves frame
+  * requests and present completions alike. */
++/* ti-pet patch (patches/ti-pet-sdk-windows-present.patch): diagnostics.
++ * Under TI_PET_DEBUG=1 the host writes "ti-pet: sdk: ..." lines straight
++ * to the inherited stderr handle (ti-pet's smoke reads them from its log):
++ * which present path each transparent window took, and every 10 s per
++ * canvas how many frame events, presents, layered updates and child
++ * WM_PAINTs happened. Unset (Electron spawns the pet with stdio ignored)
++ * it costs one cached flag check. */
++static bool tiPetDebug() {
++    static const bool enabled = [] {
++        char value[8] = {};
++        const DWORD len = GetEnvironmentVariableA("TI_PET_DEBUG", value, sizeof(value));
++        return len == 1 && value[0] == '1';
++    }();
++    return enabled;
++}
++
++static void tiPetLog(const char *format, ...) {
++    if (!tiPetDebug()) return;
++    char line[512];
++    va_list args;
++    va_start(args, format);
++    int len = vsnprintf(line, sizeof(line) - 1, format, args);
++    va_end(args);
++    if (len < 0) return;
++    if (len > (int)sizeof(line) - 2) len = (int)sizeof(line) - 2;
++    line[len++] = '\n';
++    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
++    if (!err || err == INVALID_HANDLE_VALUE) return;
++    DWORD written = 0;
++    WriteFile(err, line, (DWORD)len, &written, nullptr);
++}
++
++static void tiPetSurfaceStats(NativeView &view) {
++    if (!tiPetDebug()) return;
++    const ULONGLONG now = GetTickCount64();
++    if (view.tp_logged_ms == 0) view.tp_logged_ms = now;
++    if (now - view.tp_logged_ms < 10000) return;
++    tiPetLog("ti-pet: sdk: surface %s window %u: %u frame events, %u presents, %u layered updates (%u failed), %u child paints in %u ms",
++        view.label.c_str(), (unsigned)view.window_id, view.tp_emits, view.tp_presents, view.tp_layered_ok,
++        view.tp_layered_failed, view.tp_paints, (unsigned)(now - view.tp_logged_ms));
++    view.tp_emits = 0;
++    view.tp_presents = 0;
++    view.tp_layered_ok = 0;
++    view.tp_layered_failed = 0;
++    view.tp_paints = 0;
++    view.tp_logged_ms = now;
++}
++
+ static void gpuSurfaceEmitFrame(Host *host, NativeView &view, HWND hwnd) {
+     /* The input's responding frame is THIS one; the follow-up schedule
+      * (an armed animation re-requesting) returns to the minimized
+@@ -2800,6 +2861,8 @@
+     gpuSurfaceAdvancePacingClock(view);
+ 
+     view.gpu_frame_index += 1;
++    view.tp_emits += 1;
++    tiPetSurfaceStats(view);
+     WindowsEvent event = {};
+     event.kind = kGpuSurfaceFrame;
+     event.width = width;
+@@ -2947,6 +3010,7 @@
+             PAINTSTRUCT paint = {};
+             HDC dc = BeginPaint(hwnd, &paint);
+             if (dc) {
++                view->tp_paints += 1;
+                 paintGpuSurface(*view, hwnd, dc);
+                 /* Hidden-titlebar parents: yield the caption-button
+                  * cluster back to the DWM (see the helper's comment). */
+@@ -5418,7 +5482,125 @@
+     window.click_through = (window_flags & 4) != 0;
+ }
+ 
+-static void applyCompanionWindowChrome(Window &window) {
++/* ti-pet patch (patches/ti-pet-sdk-windows-present.patch), backported
++ * from upstream native 868d011 ("support reliable desktop overlay
++ * windows", presentTransparentWindow): per-pixel-alpha presentation for
++ * transparent top-level windows.
++ *
++ * The colour key below kept the child-HWND composition, but a layered
++ * window does not pick up a child HWND's own repaint: only a repaint of
++ * the whole window (a resize) reached the screen, so an animating canvas
++ * kept showing the frame of the last resize while the runtime presented
++ * new ones (ti-pet's Windows smoke: 47 sprite frames in 10 s, one on
++ * screen). Upstream moved transparent windows to UpdateLayeredWindow for
++ * that reason ("Layered windows do not compose child HWND redirection
++ * surfaces"). Here as there: every visible canvas's premultiplied BGRA
++ * buffer is blended, in native layer order, into one outer-window DIB
++ * that UpdateLayeredWindow submits atomically on every present, which
++ * also gives real partial alpha instead of the key's hard edges.
++ * Alpha-zero pixels stay click-through, like keyed ones. Only canvases
++ * are composed (no WebView, no non-client chrome or menu bar): ti-pet's
++ * transparent windows are chromeless, menu-less, canvas-only. */
++static uint8_t tiPetCompositeChannel(uint8_t source, uint8_t source_alpha, uint8_t destination) {
++    return (uint8_t)(source + ((uint32_t)destination * (255u - source_alpha) + 127u) / 255u);
++}
++
++static bool presentTransparentWindow(Host *host, Window &window) {
++    if (!host || !window.transparent || !window.hwnd) return false;
++    RECT outer = {};
++    if (!GetWindowRect(window.hwnd, &outer)) return false;
++    const int outer_width = outer.right - outer.left;
++    const int outer_height = outer.bottom - outer.top;
++    if (outer_width <= 0 || outer_height <= 0) return false;
++
++    BITMAPINFO target_info = {};
++    target_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
++    target_info.bmiHeader.biWidth = outer_width;
++    target_info.bmiHeader.biHeight = -outer_height;
++    target_info.bmiHeader.biPlanes = 1;
++    target_info.bmiHeader.biBitCount = 32;
++    target_info.bmiHeader.biCompression = BI_RGB;
++    void *target_bits = nullptr;
++    HDC screen = GetDC(nullptr);
++    HDC memory = screen ? CreateCompatibleDC(screen) : nullptr;
++    HBITMAP bitmap = screen ? CreateDIBSection(screen, &target_info, DIB_RGB_COLORS, &target_bits, nullptr, 0) : nullptr;
++    if (!screen || !memory || !bitmap || !target_bits) {
++        if (bitmap) DeleteObject(bitmap);
++        if (memory) DeleteDC(memory);
++        if (screen) ReleaseDC(nullptr, screen);
++        return false;
++    }
++    memset(target_bits, 0, (size_t)outer_width * (size_t)outer_height * 4);
++    uint8_t *target = reinterpret_cast<uint8_t *>(target_bits);
++
++    std::vector<const NativeView *> surfaces;
++    for (const auto &entry : host->native_views) {
++        const NativeView &view = entry.second;
++        if (view.window_id != window.id || view.kind != kViewGpuSurface || !view.hwnd || !view.visible) continue;
++        if (view.gpu_bgra.empty() || view.gpu_buf_width <= 0 || view.gpu_buf_height <= 0) continue;
++        if (view.gpu_bgra.size() < (size_t)view.gpu_buf_width * (size_t)view.gpu_buf_height * 4) continue;
++        surfaces.push_back(&view);
++    }
++    std::sort(surfaces.begin(), surfaces.end(), [](const NativeView *a, const NativeView *b) {
++        if (a->layer != b->layer) return a->layer < b->layer;
++        return a->creation_order < b->creation_order;
++    });
++
++    for (const NativeView *view : surfaces) {
++        RECT child = {};
++        if (!GetWindowRect(view->hwnd, &child)) continue;
++        const int child_width = child.right - child.left;
++        const int child_height = child.bottom - child.top;
++        if (child_width <= 0 || child_height <= 0) continue;
++        const int content_x = child.left - outer.left;
++        const int content_y = child.top - outer.top;
++        for (int y = 0; y < child_height; ++y) {
++            const int target_y = content_y + y;
++            if (target_y < 0 || target_y >= outer_height) continue;
++            const int source_y = (int)((int64_t)y * view->gpu_buf_height / child_height);
++            for (int x = 0; x < child_width; ++x) {
++                const int target_x = content_x + x;
++                if (target_x < 0 || target_x >= outer_width) continue;
++                const int source_x = (int)((int64_t)x * view->gpu_buf_width / child_width);
++                const uint8_t *source_pixel = view->gpu_bgra.data() + ((size_t)source_y * (size_t)view->gpu_buf_width + (size_t)source_x) * 4;
++                uint8_t *target_pixel = target + ((size_t)target_y * (size_t)outer_width + (size_t)target_x) * 4;
++                const uint8_t source_alpha = source_pixel[3];
++                if (source_alpha == 0) continue;
++                if (source_alpha == 255) {
++                    memcpy(target_pixel, source_pixel, 4);
++                    continue;
++                }
++                /* Premultiplied source-over: src + dst * (1 - src.a). */
++                for (size_t channel = 0; channel < 4; channel++) {
++                    target_pixel[channel] = tiPetCompositeChannel(source_pixel[channel], source_alpha, target_pixel[channel]);
++                }
++            }
++        }
++    }
++
++    HGDIOBJ previous = SelectObject(memory, bitmap);
++    POINT destination = { outer.left, outer.top };
++    SIZE size = { outer_width, outer_height };
++    POINT source = { 0, 0 };
++    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
++    const BOOL updated = UpdateLayeredWindow(window.hwnd, screen, &destination, &size, memory, &source, 0, &blend, ULW_ALPHA);
++    SelectObject(memory, previous);
++    DeleteObject(bitmap);
++    DeleteDC(memory);
++    ReleaseDC(nullptr, screen);
++    return updated != FALSE;
++}
++
++/* ti-pet patch: re-submit an alpha-layered window after its canvases
++ * moved, resized, changed layer or visibility, or closed. */
++static void presentTransparentWindowById(Host *host, uint64_t window_id) {
++    if (!host) return;
++    auto window = host->windows.find(window_id);
++    if (window == host->windows.end() || !window->second.alpha_layered) return;
++    (void)presentTransparentWindow(host, window->second);
++}
++
++static void applyCompanionWindowChrome(Host *host, Window &window) {
+     if (!window.hwnd) return;
+     if (!window.floating && !window.transparent && !window.click_through) return;
+ 
+@@ -5441,12 +5623,24 @@
+     SetWindowLongPtrW(window.hwnd, GWL_EXSTYLE, ex_style);
+ 
+     if (window.transparent) {
+-        /* Pure black is the key because the runtime clears transparent
+-         * windows to alpha zero, and the present path's swizzle writes
+-         * those cleared pixels as 0,0,0 before forcing the ignored
+-         * fourth byte to 255. Keying on black therefore drops exactly
+-         * the pixels the app meant to leave empty. */
+-        SetLayeredWindowAttributes(window.hwnd, RGB(0, 0, 0), 255, LWA_COLORKEY);
++        /* ti-pet patch: per-pixel alpha first. The initial (empty)
++         * UpdateLayeredWindow makes the layered window displayable
++         * before its first show, and must come before any
++         * SetLayeredWindowAttributes: once that was called,
++         * UpdateLayeredWindow fails until the layered bit is reset. */
++        window.alpha_layered = presentTransparentWindow(host, window);
++        const DWORD ulw_error = window.alpha_layered ? 0 : GetLastError();
++        if (window.alpha_layered) {
++            tiPetLog("ti-pet: sdk: window %u transparent: per-pixel alpha (UpdateLayeredWindow)", (unsigned)window.id);
++        } else {
++            /* Pure black is the key because the runtime clears
++             * transparent windows to alpha zero, and the present path's
++             * swizzle writes those cleared pixels as 0,0,0 before forcing
++             * the ignored fourth byte to 255. Keying on black therefore
++             * drops exactly the pixels the app meant to leave empty. */
++            SetLayeredWindowAttributes(window.hwnd, RGB(0, 0, 0), 255, LWA_COLORKEY);
++            tiPetLog("ti-pet: sdk: window %u transparent: colour key (UpdateLayeredWindow failed, error %lu)", (unsigned)window.id, (unsigned long)ulw_error);
++        }
+     } else {
+         /* Click-through without transparency: the window stays fully
+          * opaque, so the layered attributes must not remove anything.
+@@ -5531,7 +5725,7 @@
+     /* Before the first show, so a companion window never flashes as an
+      * opaque, non-topmost window for a frame on the way to its declared
+      * shape (the same reasoning as the caption color scheme above). */
+-    applyCompanionWindowChrome(window);
++    applyCompanionWindowChrome(host, window);
+     ShowWindow(hwnd, SW_SHOW);
+     UpdateWindow(hwnd);
+     SetTimer(hwnd, kFrameTimerId, 16, nullptr);
+@@ -6527,6 +6721,11 @@
+     if (width > INT_MAX || height > INT_MAX) return 0;
+     if (rgba8_len != width * height * 4) return 0;
+     NativeView &view = found->second;
++    view.tp_presents += 1;
++    /* ti-pet patch: an alpha-layered window composes this buffer itself
++     * (presentTransparentWindow), so it keeps the alpha, premultiplied. */
++    auto owner = host->windows.find(view.window_id);
++    const bool alpha_layered = owner != host->windows.end() && owner->second.alpha_layered;
+ 
+     /* Straight RGBA8 -> top-down BGRA rows for a BI_RGB 32bpp DIB. The
+      * surface is opaque (alpha_mode "opaque"), so no premultiply is
+@@ -6541,6 +6740,14 @@
+     const size_t pixel_count = width * height;
+     for (size_t index = 0; index < pixel_count; index++) {
+         const uint8_t *src = rgba8 + index * 4;
++        if (alpha_layered) {
++            const uint32_t alpha = src[3];
++            dst[index * 4 + 0] = (uint8_t)((src[2] * alpha + 127) / 255);
++            dst[index * 4 + 1] = (uint8_t)((src[1] * alpha + 127) / 255);
++            dst[index * 4 + 2] = (uint8_t)((src[0] * alpha + 127) / 255);
++            dst[index * 4 + 3] = (uint8_t)alpha;
++            continue;
++        }
+         dst[index * 4 + 0] = src[2];
+         dst[index * 4 + 1] = src[1];
+         dst[index * 4 + 2] = src[0];
+@@ -6551,7 +6758,6 @@
+ 
+     /* Hidden-titlebar windows: keep the DWM caption material behind the
+      * button cluster matched to the header the app just presented. */
+-    auto owner = host->windows.find(view.window_id);
+     if (owner != host->windows.end()) syncHiddenCaptionColor(host, owner->second, view, rgba8, width, height);
+ 
+     const size_t sample_index = ((height / 2) * width + width / 2) * 4;
+@@ -6564,7 +6770,20 @@
+         view.gpu_sample_color = ((uint32_t)sa << 24) | ((uint32_t)sr << 16) | ((uint32_t)sg << 8) | (uint32_t)sb;
+     }
+ 
+-    InvalidateRect(view.hwnd, nullptr, FALSE);
++    /* ti-pet patch: an alpha-layered window reaches the screen through
++     * UpdateLayeredWindow, now; the child invalidation stays for every
++     * other window (and as the retry for a failed update). */
++    bool layered_presented = false;
++    if (alpha_layered) {
++        layered_presented = presentTransparentWindow(host, owner->second);
++        if (layered_presented) {
++            view.tp_layered_ok += 1;
++        } else {
++            view.tp_layered_failed += 1;
++        }
++    }
++    if (!layered_presented) InvalidateRect(view.hwnd, nullptr, FALSE);
++    tiPetSurfaceStats(view);
+     /* A present is the completion producer on the surface's single
+      * frame-event scheduler: the completion event it arms is what
+      * drives the runtime's frame loop (an armed animation presents,
+@@ -6611,6 +6830,9 @@
+     std::string display_text = has_text ? view.text : nativeViewDisplayText(view);
+     if (has_visible || has_enabled || has_role || has_accessibility_label || update_text) applyNativeViewState(view, update_text, display_text);
+     if (has_layer) reorderWindowChildren(host, window_id);
++    /* ti-pet patch: a moved, resized, restacked or hidden canvas changes
++     * an alpha-layered window's composed image. */
++    if (view.kind == kViewGpuSurface && (has_frame || has_layer || has_visible)) presentTransparentWindowById(host, window_id);
+     return 1;
+ }
+ 
+@@ -6649,6 +6871,7 @@
+     if (host->native_views.find(key) == host->native_views.end()) return 0;
+     destroyNativeViewAndChildren(host, key);
+     reorderWindowChildren(host, window_id);
++    presentTransparentWindowById(host, window_id);
+     return 1;
+ }
+ 

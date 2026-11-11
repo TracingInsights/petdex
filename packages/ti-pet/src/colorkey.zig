@@ -29,6 +29,13 @@
 //! "z z", the badge and the bubble/panel are coloured), and the shadow /
 //! scrim washes are translucent black that either blends over an opaque
 //! card or should fall through.
+//!
+//! Since `patches/ti-pet-sdk-windows-present.patch` the host presents a
+//! transparent window with per-pixel alpha (UpdateLayeredWindow) and keys
+//! on nothing; the colour key above is only its fallback, taken when that
+//! first UpdateLayeredWindow fails ("ti-pet: sdk: window … colour key" under
+//! TI_PET_DEBUG). The lift stays for that fallback: on the alpha path,
+//! (0, 0, 1) cannot be told from black.
 
 const std = @import("std");
 const builtin = @import("builtin");

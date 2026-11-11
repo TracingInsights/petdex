@@ -70,3 +70,31 @@ and kept only because it helped (numbers in the tif1ai repo,
   (checked against the unpatched renderer on randomized draws);
 - the widget display-list refresh no longer zero-fills its ~300 KB
   scratch on every refresh (only the counts need a value).
+
+`patches/ti-pet-sdk-windows-present.patch` (applied after the two above)
+backports upstream native 868d011's `presentTransparentWindow` to the
+Windows host. The pinned host colour-keyed transparent windows
+(`SetLayeredWindowAttributes`, black) and painted the canvas into a child
+HWND, but a layered window does not pick up a child HWND's own repaint:
+only a whole-window repaint (a resize) reached the screen, so the sprite
+froze on the frame of the last resize while the runtime kept presenting
+(fork CI run 43022157067: 47 frame ticks in 10 s, one frame in every
+shot). Now:
+
+- a transparent window first tries per-pixel alpha: an empty
+  `UpdateLayeredWindow` before the first show, then on every canvas
+  present the window's visible canvases (premultiplied BGRA, layer order)
+  are blended into one window-sized DIB and submitted with
+  `UpdateLayeredWindow` — real partial alpha, no colour key, alpha-zero
+  pixels stay click-through; a canvas moved, resized, restacked, hidden or
+  closed re-submits;
+- if that first `UpdateLayeredWindow` fails, the window keeps the colour
+  key and the child-HWND path exactly as before (which is why
+  `src/colorkey.zig` still lifts black art);
+- with `TI_PET_DEBUG=1` the host writes `ti-pet: sdk: …` lines to stderr:
+  the path each transparent window took and, every 10 s per canvas, its
+  frame events, presents, layered updates (failed) and child WM_PAINTs.
+
+Only canvases are composed (no WebView, non-client chrome or menu bar) —
+ti-pet's transparent windows are chromeless, menu-less and canvas-only.
+Opaque windows are untouched.

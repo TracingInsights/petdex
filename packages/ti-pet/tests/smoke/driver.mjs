@@ -601,7 +601,10 @@ function screenshot(file) {
         '$b = [System.Windows.Forms.SystemInformation]::VirtualScreen',
         '$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height',
         '$g = [System.Drawing.Graphics]::FromImage($bmp)',
-        '$g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)',
+        // CAPTUREBLT: include layered windows (the pet's are) explicitly
+        // rather than rely on the DWM read-back; plain copy if refused.
+        '$op = [System.Enum]::ToObject([System.Drawing.CopyPixelOperation], ([int][System.Drawing.CopyPixelOperation]::SourceCopy) -bor ([int][System.Drawing.CopyPixelOperation]::CaptureBlt))',
+        'try { $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size, $op) } catch { $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size) }',
         `$bmp.Save('${file.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png)`
       ].join('; ');
       execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
@@ -825,21 +828,28 @@ async function stillCheck(name) {
 
 /**
  * A few more shots of `name`'s scene: an animating pet must change (its
- * frame bar moves). All the same = frozen frames (reduce motion forced on
- * by the pet, or its frame timer never fires — ti-pet.log's "appearance"
- * and "frames:" lines tell which).
+ * frame bar moves). All the same = frozen frames: reduce motion forced on
+ * by the pet, its frame timer never fires, or the frames never reach the
+ * screen. ti-pet.log tells which: "appearance", "frames:" (ticks and frame
+ * events) and, on Windows, the SDK host's "sdk:" lines (the present path
+ * each window took; frame events, presents, layered updates, child paints).
  */
 async function animatesCheck(name) {
   const first = images.get(name);
   if (!first) return;
   const box = petPixels(first).box;
+  const sdkLines = () => (platform === 'win32' ? petLogTail(/ sdk: /, 3) : []);
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     await sleep(350);
     const again = takeShot(name, join(opts.artifacts, `${String(shots.length).padStart(2, '0')}-${name}-anim${attempt}.png`));
     if (!again) return;
-    if (!sameInBox(first, again, box)) return pass(`${name}: the pets animate`);
+    if (!sameInBox(first, again, box)) {
+      for (const line of sdkLines()) info(`ti-pet.log: ${line}`);
+      return pass(`${name}: the pets animate`);
+    }
   }
-  const text = `${name}: the pets never changed in 5 shots: frozen frames (${petLogTail(/appearance|frames:/, 2).join(' | ') || 'no ti-pet.log lines'})`;
+  const lines = [...petLogTail(/appearance|frames:/, 2), ...sdkLines()];
+  const text = `${name}: the pets never changed in 5 shots: frozen frames (${lines.join(' | ') || 'no ti-pet.log lines'})`;
   if (opts.strictPixels) fail(text);
   warn(text);
 }
@@ -1341,6 +1351,8 @@ async function smoke(cleanup) {
   const appearanceDeadline = Date.now() + 3000;
   while (Date.now() < appearanceDeadline && petLogTail(/appearance/).length === 0) await sleep(100);
   info(`ti-pet.log: ${petLogTail(/appearance/, 1)[0] ?? 'no appearance line yet'}`);
+  // Windows: the present path the pet window took (ti-pet-sdk-windows-present.patch).
+  if (platform === 'win32') info(`ti-pet.log: ${petLogTail(/ sdk: window /, 1)[0] ?? 'no sdk: window line yet'}`);
   if (platform === 'darwin') {
     const reduce = spawnSync('defaults', ['read', 'com.apple.universalaccess', 'reduceMotion'], { encoding: 'utf8', timeout: 10_000 });
     info(`macOS reduceMotion setting: ${(reduce.stdout || reduce.stderr || '').trim() || 'unreadable'}`);
