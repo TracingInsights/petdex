@@ -36,19 +36,31 @@ jobs:
           - target: linux-x64
             runner: ubuntu-24.04
             exe: ""
+            build_flags: ""
           - target: win32-x64
             runner: windows-2022
             exe: ".exe"
+            build_flags: ""
           # Unsigned on purpose: the binary is nested in the TracingInsights
           # app bundle, and electron-builder signs every Mach-O inside it
           # when the app itself is signed. Unlike upstream's standalone
           # .app there is nothing for Gatekeeper to judge on its own.
+          #
+          # darwin-arm64 is cross-compiled on the Intel runner (Zig targets
+          # aarch64 directly; the runner's Apple SDK links it): GitHub's
+          # arm64 macOS runners (macos-15 included) were often not acquired
+          # at all in Nov 2026 ("capacity constraints"), which blocked the
+          # whole release. The arm64 binary is still run on real arm64
+          # hardware by ti-pet-smoke.yml on every change; the stage step
+          # below checks the Mach-O arch.
           - target: darwin-arm64
-            runner: macos-15
+            runner: macos-15-intel
             exe: ""
+            build_flags: "-Dtarget=aarch64-macos"
           - target: darwin-x64
             runner: macos-15-intel
             exe: ""
+            build_flags: ""
 
     steps:
       - name: Checkout petdex
@@ -131,7 +143,7 @@ jobs:
         working-directory: packages/ti-pet
         shell: bash
         run: |
-          "$NATIVE_CLI" build -Dcpu=baseline -Dtrace=off
+          "$NATIVE_CLI" build -Dcpu=baseline -Dtrace=off ${{ matrix.build_flags }}
           ls -lh zig-out/bin/
 
       - name: Stage the binary
