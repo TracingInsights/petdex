@@ -92,8 +92,19 @@ jobs:
 
       - name: Install Linux GUI libraries
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libx11-dev pkg-config webp-pixbuf-loader
+          # GitHub's default Ubuntu mirror (azure.archive.ubuntu.com) stopped
+          # resolving on 2026-11-11 and every package waited out a timeout:
+          # try kernel.org's and Canonical's mirrors first, Azure last, and
+          # give up on a dead mirror quickly.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\tpriority:%s\n' \
+              http://mirrors.edge.kernel.org/ubuntu/ 1 \
+              http://archive.ubuntu.com/ubuntu/ 2 \
+              http://azure.archive.ubuntu.com/ubuntu/ 3 | sudo tee /etc/apt/apt-mirrors.txt
+          fi
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y libgtk-4-dev libx11-dev pkg-config webp-pixbuf-loader
 
       - name: Clone the Native SDK
         # Keep identical to ti-pet-release.yml (and upstream's pin).

@@ -29,6 +29,8 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # A hung step (e.g. a dead package mirror) fails in 30 min, not 6 h.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -88,8 +90,19 @@ jobs:
         # (GtkFileDialog); 22.04 ships 4.6. Older distros get the Electron pet.
         if: matrix.target == 'linux-x64'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libx11-dev pkg-config webp-pixbuf-loader
+          # GitHub's default Ubuntu mirror (azure.archive.ubuntu.com) stopped
+          # resolving on 2026-11-11 and every package waited out a timeout:
+          # try kernel.org's and Canonical's mirrors first, Azure last, and
+          # give up on a dead mirror quickly.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\tpriority:%s\n' \
+              http://mirrors.edge.kernel.org/ubuntu/ 1 \
+              http://archive.ubuntu.com/ubuntu/ 2 \
+              http://azure.archive.ubuntu.com/ubuntu/ 3 | sudo tee /etc/apt/apt-mirrors.txt
+          fi
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y libgtk-4-dev libx11-dev pkg-config webp-pixbuf-loader
 
       - name: Clone the Native SDK
         # Same pin as upstream's desktop-release.yml and desktop-native-ci.yml
